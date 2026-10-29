@@ -4,6 +4,7 @@ mod repl;
 
 use std::process::ExitCode;
 
+use glassdb_core::{Pager, VERSION};
 use repl::{Action, handle_line};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -14,7 +15,17 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    println!("GlassDB {} — {path}", glassdb_core::VERSION);
+    // Opens the file, or creates a new one-page database if it doesn't exist.
+    let pager = match Pager::open_file(&path) {
+        Ok(pager) => pager,
+        Err(err) => {
+            eprintln!("error: cannot open {path}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pages = pager.page_count();
+    let unit = if pages == 1 { "page" } else { "pages" };
+    println!("GlassDB {VERSION} — {path} ({pages} {unit})");
     println!("Enter \".exit\" to quit.");
 
     // rustyline gives line editing and history on a terminal, and falls back
@@ -47,6 +58,11 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    if let Err(err) = pager.close() {
+        eprintln!("error: cannot save {path}: {err}");
+        return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }

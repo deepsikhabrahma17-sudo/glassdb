@@ -13,3 +13,6 @@ path = "src/main.rs"
 [dependencies]
 glassdb-core.workspace = true
 rustyline = "19.0.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
