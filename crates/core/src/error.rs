@@ -3,6 +3,7 @@
 use std::fmt;
 use std::io;
 
+use crate::btree::node::{MAX_ENTRY, MAX_KEY};
 use crate::pager::PageId;
 
 #[derive(Debug)]
@@ -21,6 +22,8 @@ pub enum Error {
     Corrupt(String),
     /// Every page id is in use.
     DatabaseFull,
+    /// A B+ tree entry over the size limits (`MAX_KEY`, `MAX_ENTRY`).
+    EntryTooLarge { key_len: usize, value_len: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -35,6 +38,11 @@ impl fmt::Display for Error {
             Error::PageOutOfRange(id) => write!(f, "page {id} is out of range"),
             Error::Corrupt(msg) => write!(f, "database file is corrupt: {msg}"),
             Error::DatabaseFull => write!(f, "database is full: no page ids left"),
+            Error::EntryTooLarge { key_len, value_len } => write!(
+                f,
+                "entry too large: key {key_len} bytes, value {value_len} bytes \
+                 (limits: key {MAX_KEY}, key + value {MAX_ENTRY})"
+            ),
         }
     }
 }

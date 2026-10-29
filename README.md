@@ -23,8 +23,8 @@ together:
 - ⏪ **Time-travel queries.** Old row versions are kept, so
   `SELECT * FROM users AS OF '2026-11-01 10:00'` returns the table exactly as it was then.
 
-> **Status:** early development. The storage foundation (pager, file format and
-> buffer cache) is done. SQL is not available yet. See the [roadmap](#roadmap).
+> **Status:** early development. The storage engine (pager, buffer cache and
+> B+ tree) is done. SQL is not available yet. See the [roadmap](#roadmap).
 
 ## Contents
 
@@ -78,12 +78,30 @@ a freed page, closes, reopens, and dumps the raw header bytes from disk.
    [event] disk  READ   page 1
 ```
 
+```bash
+cargo run -p glassdb-core --example btree_tour
+```
+
+The B+ tree tour draws the tree after every step while it splits, grows a
+level, scans a range along the leaf chain, borrows, merges and shrinks back:
+
+```text
+== 2. Insert k04: the leaf overflows, splits, and the root grows a level
+   [event] SPLIT   page 1 → right half to page 2, separator "k02" goes up
+   [event] GROW    root page 1 now points to pages 3 and 2
+   height 2, 2 leaves, 5 entries:
+     page 1 (root) internal: k02
+       page 3 leaf: k00 k01 → page 2
+       page 2 leaf: k02 k03 k04 → end
+```
+
 ## What works today
 
 | Layer | What it does |
 | --- | --- |
 | **Pager** | Splits the file into 4 KB pages. Page 0 is a header: magic bytes, version, page count and free-list head |
 | **Buffer cache** | A fixed number of in-memory frames with O(1) LRU eviction. Changed pages are written back when evicted or flushed |
+| **B+ tree** | Byte-string keys and values in 4 KB slotted pages. Insert with leaf and internal splits, delete with merge or borrow, ordered range scans along linked leaves |
 | **Free list** | Freed pages are linked through themselves and reused before the file grows |
 | **Tracer** | Every layer reports events (hit, miss, evict, read, write). They cost nothing when tracing is off and will drive the visualizer |
 | **Storage** | A file on disk or a buffer in memory, behind one trait, so the same engine can run in a browser |
@@ -114,7 +132,7 @@ flowchart TD
     TRACE -.-> VIZ["Glass-box visualizer"]
 
     classDef done fill:#d1fae5,stroke:#059669,color:#064e3b
-    class PAGER,DISK,UI,TRACE done
+    class BTREE,PAGER,DISK,UI,TRACE done
 ```
 
 Green layers exist today. The rest are on the [roadmap](#roadmap).
@@ -139,9 +157,10 @@ cargo test --workspace
 | --- | --- | --- |
 | Unit tests | next to the code (`#[cfg(test)]`) | Header encoding, LRU order, eviction, free list, error cases |
 | Roundtrip tests | `crates/core/tests/pager_roundtrip.rs` | 1,000 pages written through a 16-frame cache, reopened, and every byte matches |
+| Property tests | `crates/core/tests/btree_props.rs` | Random inserts, deletes, lookups and range scans (including 100,000-op runs) always match Rust's `BTreeMap` |
 | CLI tests | `crates/cli/tests/cli.rs` | The real binary creates files, echoes input and rejects non-database files |
 
-Planned: property tests against Rust's `BTreeMap`, crash tests that kill the
+Planned: crash tests that kill the
 process mid-write, parser fuzzing, and benchmarks against SQLite.
 
 ## Project layout
@@ -151,6 +170,7 @@ glassdb/
 ├── crates/
 │   ├── core/              engine library (glassdb-core)
 │   │   ├── src/
+│   │   │   ├── btree/     B+ tree nodes, splits, merges, cursors
 │   │   │   ├── pager/     pages, header, buffer cache
 │   │   │   ├── storage.rs file and in-memory storage
 │   │   │   ├── trace.rs   glass-box event stream
@@ -166,7 +186,7 @@ glassdb/
 
 - [x] **Setup:** workspace, CLI prompt, CI
 - [x] **Pager & file format:** 4 KB pages, header, LRU buffer cache, free list, tracer
-- [ ] **B+ tree:** search, insert with splits, delete with merges, range cursors
+- [x] **B+ tree:** search, insert with splits, delete with merges, range cursors
 - [ ] **SQL front end & catalog:** `CREATE`, `INSERT`, `SELECT … WHERE … ORDER BY … LIMIT`, `UPDATE`, `DELETE`
 - [ ] **Write-ahead log:** checksummed frames, recovery, checkpoints
 - [ ] **Transactions:** `BEGIN`, `COMMIT`, `ROLLBACK`

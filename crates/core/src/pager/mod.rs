@@ -14,6 +14,7 @@ mod tests;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::bytes::{get_u32, put_u32};
 use crate::error::{Error, Result};
 use crate::storage::{FileStorage, Storage};
 use crate::trace::{Event, NoopTracer, Tracer};
@@ -106,6 +107,11 @@ impl Pager {
     /// Number of pages on the free list.
     pub fn free_count(&self) -> u32 {
         self.header.free_count
+    }
+
+    /// The tracer every layer above the pager reports to.
+    pub fn tracer(&self) -> &dyn Tracer {
+        &*self.tracer
     }
 
     /// Return a copy of page `id`.
@@ -245,14 +251,4 @@ impl Pager {
 /// Byte offset of page `id` in the file.
 fn offset(id: PageId) -> u64 {
     u64::from(id) * PAGE_SIZE as u64
-}
-
-/// Read a little-endian u32 at `at`.
-pub(crate) fn get_u32(buf: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(buf[at..at + 4].try_into().unwrap())
-}
-
-/// Write `value` as a little-endian u32 at `at`.
-pub(crate) fn put_u32(buf: &mut [u8], at: usize, value: u32) {
-    buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }

@@ -4,11 +4,14 @@
 //! So far: `storage` (raw bytes), `pager` (4 KB pages and the buffer cache)
 //! and `trace` (the event stream every layer reports to).
 
+pub mod btree;
+mod bytes;
 pub mod error;
 pub mod pager;
 pub mod storage;
 pub mod trace;
 
+pub use btree::{BTree, TreeStats};
 pub use error::{Error, Result};
 pub use pager::{PAGE_SIZE, Page, PageId, Pager};
 pub use storage::{FileStorage, MemStorage, Storage};

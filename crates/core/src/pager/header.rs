@@ -12,7 +12,8 @@
 //! | 20..24 | number of free pages                        |
 //! | 24..   | zero                                        |
 
-use super::{PAGE_SIZE, Page, PageId, get_u32, put_u32};
+use super::{PAGE_SIZE, Page, PageId};
+use crate::bytes::{get_u32, put_u32};
 use crate::error::{Error, Result};
 
 pub const MAGIC: [u8; 8] = *b"GLASSDB\0";

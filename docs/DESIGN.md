@@ -153,6 +153,157 @@ each event costs one call to an empty function, which is tiny next to any I/O.
 A generic `Tracer` parameter would cost nothing at all, but every type above
 the pager would have to carry it (`BTree<T>`, `Engine<T>`, …).
 
+B+ tree events (the tree reaches the shared tracer through `pager.tracer()`):
+
+| Event | When |
+| --- | --- |
+| `NodeVisit { page }` | A node is read on the way to a key (sent before the page read) |
+| `NodeSplit { page, new_page, separator }` | A full node split; `separator` went to the parent |
+| `NodeMerge { left, right }` | An underfull node and its neighbour merged into `left`; `right` was freed |
+| `NodeBorrow { left, right }` | Two neighbours too full to merge shared their entries evenly |
+| `RootGrow { root, left, right }` | The root split; its halves moved to `left` and `right` |
+| `RootShrink { root, child }` | The root's only child was pulled up into the root page and freed |
+
+## B+ tree
+
+A B+ tree maps byte-string keys to byte-string values, ordered byte by byte
+(the same order as `BTreeMap<Vec<u8>, Vec<u8>>`). Every entry lives in a leaf.
+Internal nodes hold only separator keys that steer a search, and leaves are
+linked left to right for range scans. Tables, indexes and the catalog will all
+be B+ trees. Numbers will be stored in a byte form that sorts correctly.
+
+### API
+
+```rust
+let tree = BTree::create(&mut pager)?;   // or BTree::open(root_page)
+tree.insert(&mut pager, key, value)?;    // -> Option<old value>
+tree.get(&mut pager, key)?;              // -> Option<value>
+tree.delete(&mut pager, key)?;           // -> Option<old value>
+tree.range(&mut pager, Bound::Included(a), Bound::Excluded(b))?;  // iterator, in key order
+tree.check(&mut pager)?;                 // verify every invariant -> TreeStats
+tree.dump(&mut pager)?;                  // the tree as indented text
+```
+
+**Decision:** a `BTree` is just its root page id, and the shared `Pager` is
+passed into each call, so any number of trees share one pager and one cache.
+
+**Decision: the root page id never changes.**
+- When the root splits, its contents move to two new pages and the root page
+  becomes their parent (`RootGrow`).
+- When the root is left with one child, that child is copied into the root
+  page and freed (`RootShrink`).
+
+So the catalog stores a table's root page once and never updates it.
+
+### Size limits
+
+| Limit | Value | Why |
+| --- | --- | --- |
+| `MAX_KEY` | 512 bytes | An internal node always holds at least 7 keys |
+| `MAX_ENTRY` (key + value) | 1000 bytes | A leaf always holds at least 4 entries |
+| `MIN_FILL` | 1024 bytes (¼ page) | Below this, a node other than the root is underfull |
+
+Larger entries are rejected with `EntryTooLarge`. Storing big values across
+several pages ("overflow pages") is left for later.
+
+### Node page layout (slotted page)
+
+| Bytes | Field |
+| --- | --- |
+| 0 | kind: `1` = leaf, `2` = internal |
+| 1–3 | cell count (u16) |
+| 3–5 | offset where the cell area starts (u16) |
+| 5–9 | leaf: next leaf page (`0` = last); internal: rightmost child |
+| 9–12 | reserved, zero |
+| 12– | slot array: one u16 cell offset per cell, in key order |
+| …end | cells, packed backwards from the end of the page |
+
+| Cell | Layout |
+| --- | --- |
+| Leaf | `key_len u16 · value_len u16 · key · value` |
+| Internal | `child u32 · key_len u16 · key`, where `child` holds keys **below** `key` |
+
+An internal node with `n` keys has `n + 1` children. Child `i` holds keys in
+`keys[i-1] ≤ k < keys[i]`, and the rightmost child (kept in the header) holds
+everything at or above the last key. So a search goes to child number
+"how many keys are ≤ the search key".
+
+**Decision: change a decoded copy.** A node is decoded into a plain
+`Node { entries / keys + children }`, changed with ordinary `Vec` operations,
+and encoded back packed tight. Free space never fragments, and split and merge
+logic needs no byte juggling. The cost is decoding a whole node per visit. The
+format is still a real slotted page, so a later version can binary-search the
+raw page without decoding it, with no format change.
+
+Decoding checks every offset and length, so a damaged page gives `Corrupt`
+naming the page instead of a panic.
+
+### Insert and delete: one recursive walk
+
+`modify(page, key, change)` handles both insert and delete. It changes its
+subtree, writes its own node back, and reports to the parent:
+
+| Outcome | Meaning | Parent's repair |
+| --- | --- | --- |
+| `Fine` | nothing to do | none; the parent isn't rewritten |
+| `Split { separator, right }` | the node overflowed and split | insert `separator` and `right` after this child |
+| `Underfull` | below `MIN_FILL` | merge with or borrow from a neighbour |
+
+A repair changes the parent, which can then overflow or underflow in turn, so
+repairs ripple up level by level. The root's outcome is handled by
+`RootGrow` / `RootShrink`.
+
+**Splitting (overflow).** Entries vary in size, so the split point is chosen
+by **bytes**: the two halves end up as close to equal as possible.
+- **Leaf split:** the right half's first key is *copied* up as the separator,
+  and the leaf chain is re-linked as left → right → old next.
+- **Internal split:** the middle key *moves* up and leaves this level.
+
+A node overflows by at most one cell (one new entry, or a longer separator
+after a borrow), so one split always leaves two halves that fit.
+
+**Underflow.** An underfull child is paired with its left neighbour, or with
+its right neighbour if it is the first child.
+- **Merge:** if the two fit in one page, everything moves into the left page,
+  the right page goes back to the free list, and the separator between them is
+  removed from the parent. For internal nodes, that separator comes down
+  between the two key lists.
+- **Borrow:** if they don't fit, the combined entries are split evenly back
+  into the same two pages, and the parent gets the new separator.
+
+  Why that leaves both halves full enough: the combined size is over 4 KB and
+  a cell is at most ~1 KB, so each half gets at least ~1.5 KB, which is above `MIN_FILL`.
+
+Deleting a key never touches separators above it. A separator only has to
+steer searches correctly, not equal a live key.
+
+### Range scans
+
+`range(start, end)` searches down once to the leaf where `start` would be,
+skips the entries below `start`, then follows the `next` links. It is an
+`Iterator<Item = Result<(key, value)>>`, and it borrows the pager mutably, so
+the tree cannot change during a scan.
+
+### Testing
+
+- `btree/node.rs`: encode/decode round trips, the exact byte layout, size
+  accounting, and corrupt pages.
+- `btree/tests.rs`: one scenario per shape change (first split and root grow,
+  internal split, merge and root shrink, borrow, delete-all with no leaked
+  pages, range bounds, size limits, empty key, dump). Each checks the exact
+  structural events.
+- `tests/btree_props.rs` (proptest), compared against `BTreeMap`:
+  - 256 random sequences of up to 2,000 inserts, deletes, gets and range scans,
+    with mixed short and long keys.
+  - 100,000 random inserts and deletes per seed (4 seeds) on a 32-frame cache.
+    `check()` runs every 5,000 operations. At the end the tree is emptied and
+    must leak no pages.
+- **Guarding the tests:** each of these bugs was planted once and made the
+  property test fail with a shrunk, minimal example:
+  - searching left on a key equal to a separator
+  - never rebalancing underfull nodes
+  - treating an exclusive range end as inclusive
+
 ## Continuous integration
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request:

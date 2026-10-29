@@ -115,6 +115,8 @@ fn show(tracer: &RecordingTracer) {
             }
             Event::PageRead { page } => format!("disk  READ   page {page}"),
             Event::PageWrite { page } => format!("disk  WRITE  page {page}"),
+            // B+ tree events; the pager alone never produces them.
+            other => format!("{other:?}"),
         };
         println!("   [event] {line}");
     }

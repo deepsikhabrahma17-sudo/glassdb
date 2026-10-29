@@ -22,6 +22,30 @@ pub enum Event {
     /// A page was dropped from the cache to make room; `dirty` means it had
     /// changes that must be written back.
     CacheEvict { page: PageId, dirty: bool },
+
+    /// A B+ tree node was read on the way to a key.
+    NodeVisit { page: PageId },
+    /// A full node split: `page` kept the left half, `new_page` took the right,
+    /// and `separator` was added to the parent.
+    NodeSplit {
+        page: PageId,
+        new_page: PageId,
+        separator: Vec<u8>,
+    },
+    /// An underfull node and its neighbour were merged into `left`; `right` was freed.
+    NodeMerge { left: PageId, right: PageId },
+    /// Two neighbours too full to merge shared their entries evenly instead.
+    NodeBorrow { left: PageId, right: PageId },
+    /// The root split: its two halves moved to `left` and `right`, and the
+    /// root page became their parent. The tree grew one level.
+    RootGrow {
+        root: PageId,
+        left: PageId,
+        right: PageId,
+    },
+    /// The root had a single child, which was copied into the root page and
+    /// freed. The tree shrank one level.
+    RootShrink { root: PageId, child: PageId },
 }
 
 /// Receives engine events. The default method ignores them.
