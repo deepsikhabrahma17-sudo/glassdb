@@ -1,6 +1,6 @@
 //! End-to-end tests: run the real `glassdb` binary with piped stdin.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -13,12 +13,13 @@ fn run(args: &[&str], input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn glassdb");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    // glassdb may exit before reading its input (for example when it refuses
+    // to open the file). Its end of the pipe is then closed, so the write
+    // fails with BrokenPipe. That is expected, not a test failure.
+    let written = child.stdin.take().unwrap().write_all(input.as_bytes());
+    if let Err(err) = written {
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe, "writing stdin: {err}");
+    }
     child.wait_with_output().expect("wait for glassdb")
 }
 
