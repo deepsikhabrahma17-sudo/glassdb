@@ -1,0 +1,15 @@
+[package]
+name = "glassdb"
+description = "Command-line prompt for the GlassDB SQL engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "glassdb"
+path = "src/main.rs"
+
+[dependencies]
+glassdb-core.workspace = true
+rustyline = "19.0.0"

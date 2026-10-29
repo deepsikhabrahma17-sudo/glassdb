@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/deepsikhabrahma17-sudo/glassdb"
+
+[workspace.dependencies]
+glassdb-core = { path = "crates/core", version = "0.1.0" }

@@ -1,0 +1,9 @@
+[package]
+name = "glassdb-core"
+description = "GlassDB engine: a small SQL database with time-travel queries and a glass-box visualizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
