@@ -1,0 +1,96 @@
+# Errors are reported clearly, and a statement that fails changes nothing.
+
+statement error syntax error at 1:8: expected an expression, found FROM
+SELECT FROM users
+
+statement error no such table: ghosts
+SELECT * FROM ghosts
+
+statement ok
+CREATE TABLE t (id INT PRIMARY KEY, name TEXT, ok BOOL)
+
+statement error table t already exists
+CREATE TABLE t (x INT)
+
+statement error duplicate column a
+CREATE TABLE d (a INT, a TEXT)
+
+statement error only one PRIMARY KEY
+CREATE TABLE d (a INT PRIMARY KEY, b INT PRIMARY KEY)
+
+statement error PRIMARY KEY must be INT, but a is TEXT
+CREATE TABLE d (a TEXT PRIMARY KEY)
+
+statement error unknown type float
+CREATE TABLE d (a FLOAT)
+
+statement error no such column: nope
+SELECT nope FROM t
+
+statement error no such column: nope
+UPDATE t SET nope = 1
+
+statement error no such column: nope
+SELECT * FROM t WHERE nope = 1
+
+statement error no such column: nope
+SELECT * FROM t ORDER BY nope
+
+statement error column name is TEXT, got INT 5
+INSERT INTO t VALUES (1, 5, TRUE)
+
+statement error INSERT has 2 values for 3 columns
+INSERT INTO t VALUES (1, 'x')
+
+statement error duplicate column name in INSERT
+INSERT INTO t (name, name) VALUES ('a', 'b')
+
+statement error no such column: x
+INSERT INTO t (id) VALUES (x)
+
+statement error LIMIT must be a non-negative INT
+SELECT * FROM t LIMIT -1
+
+statement error SELECT * needs a FROM clause
+SELECT *
+
+statement error use single quotes
+SELECT "name" FROM t
+
+statement error unterminated string
+SELECT 'oops
+
+statement error row too large
+INSERT INTO t VALUES (1, 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', TRUE)
+
+# None of the failures above wrote anything.
+query
+SELECT * FROM t
+----
+id | name | ok
+
+statement ok
+INSERT INTO t VALUES (1, 'a', TRUE)
+
+# WHERE is checked row by row, so this needs a row to catch.
+statement error WHERE must be BOOL, got INT
+SELECT * FROM t WHERE 1
+
+statement error primary key id can't be NULL
+UPDATE t SET id = NULL
+
+# A multi-row INSERT with one bad row writes none of its rows.
+statement error column ok is BOOL, got INT 7
+INSERT INTO t VALUES (2, 'b', TRUE), (3, 'c', 7)
+
+statement error duplicate primary key: t.id = 1
+INSERT INTO t VALUES (4, 'd', TRUE), (1, 'again', FALSE)
+
+query
+SELECT * FROM t
+----
+id | name | ok
+1 | a | true
+
+statement error no such table: ghosts
+DROP TABLE ghosts

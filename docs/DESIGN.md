@@ -8,7 +8,7 @@ It grows with each build phase.
 | Crate | Package name | Kind | Purpose |
 | --- | --- | --- | --- |
 | `crates/core` | `glassdb-core` | library | The engine: pager, B+ tree, WAL, MVCC, SQL, planner, tracer |
-| `crates/cli` | `glassdb` | binary | The `glassdb` prompt (`cargo install glassdb`) |
+| `crates/cli` | `glassdb` | binary | The `glassdb` SQL prompt (`cargo install glassdb`) |
 
 A browser crate (`crates/wasm`) and the visualizer (`web/`) are added when the
 glass-box phase starts, so early phases don't carry a WebAssembly toolchain.
@@ -25,18 +25,27 @@ glassdb <database-file>
 ```
 
 - With no file argument, it prints usage to stderr and exits with code 2.
-- It prints a banner with the version and file name, then shows a `glassdb> ` prompt.
-- Lines are trimmed. A blank line does nothing. `.exit` or `.quit` leaves.
-  Ctrl-D (end of input) also leaves with exit code 0. Ctrl-C clears the current line.
-- Prompt logic lives in `crates/cli/src/repl.rs` as a pure function
-  (`handle_line`), so it is unit tested without a terminal. `main.rs` only does I/O.
+- It opens the file, or creates a new database (header page and empty
+  catalog). Then it prints a banner with the version, the file name and the
+  table count. A file that isn't a GlassDB database is reported and left
+  untouched (exit code 1).
+- **Input** collects lines until the text ends with a `;` that isn't inside a
+  `'string'` or a `-- comment`. A statement can span lines (the prompt shows
+  `   ...>`), and one line can hold several statements. A syntax error in one
+  of them runs none; a runtime error stops at that statement.
+- **Output:**
+  - `SELECT` results print as an aligned table, with numbers right-aligned,
+    ending in `(n rows)`.
+  - Other statements print a line, such as `inserted 2 rows`.
+  - Errors go to stderr as `error: …`, and the session carries on.
+- **Dot commands** (only at the start of a statement): `.tables`,
+  `.schema [table]`, `.help`, `.exit` / `.quit`.
+- **Keys:** Ctrl-C drops a half-typed statement. Ctrl-D (end of input) runs
+  anything left unfinished, then exits with code 0. So `glassdb my.db < script.sql` works.
+- **Code layout:** `repl.rs` (statement buffering) and `render.rs` (tables)
+  are pure functions with unit tests. `main.rs` only does I/O.
 - `rustyline` provides line editing and history on a terminal, and plain line
   reads when stdin is piped. The integration tests depend on that piped mode.
-
-The CLI opens the file through the pager, creating a one-page database if it is
-missing, and shows the page count in the banner. A file that isn't a GlassDB
-database is reported and left untouched (exit code 1). On exit the pager is
-closed (flushed). Input is still only echoed until the SQL layer exists.
 
 ## Storage
 
@@ -303,6 +312,198 @@ the tree cannot change during a scan.
   - searching left on a key equal to a separator
   - never rebalancing underfull nodes
   - treating an exclusive range end as inclusive
+
+## SQL
+
+### Statements
+
+```sql
+CREATE TABLE [IF NOT EXISTS] t (col TYPE [PRIMARY KEY], ...)
+DROP TABLE [IF EXISTS] t
+INSERT INTO t [(col, ...)] VALUES (expr, ...), ...
+SELECT * | expr [[AS] alias], ... [FROM t] [WHERE expr]
+       [ORDER BY expr [ASC|DESC], ...] [LIMIT n [OFFSET m]]
+UPDATE t SET col = expr, ... [WHERE expr]
+DELETE FROM t [WHERE expr]
+```
+
+- **Types:** `INT` (also spelled `INTEGER`), `REAL`, `TEXT`, `BOOL` (also
+  `BOOLEAN`). `NULL` fits any column.
+- **Names:** keywords and names are case-insensitive, and names are stored in
+  lower case. Type names are ordinary words, not keywords, so a column may be
+  called `text`.
+- **Not supported yet:** joins, aggregates (`COUNT`, …), `LIKE`, indexes,
+  qualified names (`t.col`), double-quoted names.
+
+### Front end: tokens → syntax tree
+
+- **Tokenizer** (`sql/token.rs`):
+  - Every token records its line and column, so errors read
+    `syntax error at 1:8: expected an expression, found FROM`.
+  - `''` inside a string is a quote character.
+  - `--` starts a comment.
+  - Double quotes get a hint to use single quotes.
+- **Parser** (`sql/parser.rs`, `sql/expr.rs`): recursive descent, one method
+  per grammar rule. Expressions have one method per precedence level, loosest first:
+
+  | Level | Operators |
+  | --- | --- |
+  | 1 | `OR` |
+  | 2 | `AND` |
+  | 3 | `NOT` |
+  | 4 | `= <> != < <= > >=`, `IS [NOT] NULL` (comparisons don't chain) |
+  | 5 | `+ -` |
+  | 6 | `* / %` |
+  | 7 | unary `-` |
+
+- **Number literals:**
+  - A number with `.` or an exponent is REAL, otherwise INT.
+  - A minus written right before a number is part of the literal, so
+    `-9223372036854775808` (`i64::MIN`) can be written.
+  - `-(5)` is folded into the literal `-5`.
+- **Printing back:** every syntax tree prints back as tidy SQL with only the
+  parentheses it needs, and parsing the printed text gives the same tree
+  (tested). Printed SQL is used in three places:
+  - the catalog stores each table as a printed `CREATE TABLE`
+  - a `SELECT` column without an alias is named by its printed expression
+  - the tracer's `Statement` event carries the printed statement
+
+### Values and rules
+
+- **INT and REAL mix freely.** `INT op INT` gives an INT, and a REAL on either
+  side gives a REAL. INT and REAL compare as numbers.
+- **Integer errors:** integer overflow is an error, and so is dividing by zero
+  (INT or REAL). An error is chosen over a guess.
+- **Type mismatches are errors.** Comparing different types (`1 = 'one'`),
+  arithmetic on TEXT or BOOL, `NOT 1` and `TRUE AND 1` all fail.
+- **NULL means unknown**, so expressions follow three-valued logic:
+  - `NULL + 1` and `NULL = NULL` are NULL.
+  - `NULL AND FALSE` is false, and `NULL OR TRUE` is true: the deciding value
+    wins even against unknown.
+  - `WHERE` keeps a row only if the condition is TRUE.
+- **Storing values:** a value must match its column's type, except that an
+  INT is accepted into a REAL column and stored as REAL. Errors name the
+  column: `column name is TEXT, got INT 5`.
+- **Sorting:** `ORDER BY` puts NULLs first, or last with `DESC`. The sort is
+  stable. `ORDER BY` can name an output alias (`ORDER BY curved`); a real
+  column with the same name wins.
+- **Limitation:** column names are checked before any row is read, but value
+  types only as rows are evaluated. So `SELECT * FROM t WHERE 1` errors only
+  if `t` has a row. Checking types before running is left for the planner.
+
+### Rows and keys on disk
+
+Each table is a B+ tree. The **key** is the row id as 8 bytes. The sign bit
+is flipped and the bytes are written big-endian, so byte order equals numeric
+order (property-tested for all `i64`). The **value** is the row:
+
+| Bytes | Field |
+| --- | --- |
+| 0–2 | column count (u16) |
+| … | for each column: a type tag byte, then its data |
+
+| Tag | Type | Data |
+| --- | --- | --- |
+| 0 | NULL | none |
+| 1 | INT | 8 bytes, little-endian i64 |
+| 2 | REAL | 8 bytes, little-endian f64 |
+| 3 | TEXT | u16 length + UTF-8 |
+| 4 | BOOL | 1 byte |
+
+- Decoding checks every length, and rejects extra bytes and unknown tags.
+- A row may be at most `MAX_ENTRY - 8` = 992 bytes (the B+ tree's entry limit
+  minus the key). Larger rows are rejected with `row too large`. Overflow
+  pages would lift this.
+
+**Decision: `INT PRIMARY KEY` is the row id** (as in SQLite).
+- The primary key's value is the B+ tree key, so it is unique by
+  construction, and duplicates give `duplicate primary key: t.id = 3`.
+- Without a primary key, or when one is given as NULL, a row gets the next id:
+  one more than the largest key, found with `BTree::last()`.
+- Only one INT column can be the primary key.
+
+### Catalog
+
+- The catalog is the B+ tree whose root is **page 1**. It is created when the
+  database is new (only the header exists, so the first allocated page is 1).
+  Because a tree's root never moves, page 1 stays the catalog. The file header
+  needed no change.
+- Each entry maps the table name to the table's root page (4 bytes,
+  little-endian) followed by its `CREATE TABLE` statement as tidy SQL.
+- On every lookup the SQL is parsed again to rebuild the schema, as SQLite
+  does. The schema stays human-readable, and `.schema` prints it straight back.
+- Opening a file reads page 1 at once, so a file without a valid catalog fails
+  to open with `Corrupt`.
+- `CREATE TABLE` checks the definition before allocating anything: an
+  existing table, duplicate columns, more than one primary key, or a non-INT
+  primary key are all rejected.
+- `DROP TABLE` frees every page of the table with `BTree::destroy()`, then
+  removes the catalog entry.
+
+### Executor
+
+`Database` (`exec/`) runs statements:
+
+```rust
+let mut db = Database::open("my.db")?;
+db.execute("INSERT INTO t VALUES (1, 'x')")?;   // -> Output::Inserted(1)
+for statement in sql::parse(script)? { db.run(&statement)?; }
+db.close()?;
+```
+
+`Output` is `Message` (CREATE/DROP), `Inserted(n)`, `Updated(n)`, `Deleted(n)`,
+or `Rows { columns, rows }`.
+
+- **SELECT:**
+  1. Check every column name.
+  2. Scan the whole table in key order.
+  3. Filter with WHERE.
+  4. Compute the output columns.
+  5. Sort (stable).
+  6. Apply OFFSET, then LIMIT.
+
+  `SELECT` without `FROM` computes one row. Every scan reads the whole table
+  for now; using indexes to read less comes with the query planner.
+- **Decision: check everything, then write.**
+  - INSERT evaluates and type-checks every row, assigns ids and checks keys
+    before writing any of them.
+  - UPDATE computes every new row first. A row whose key changes may move onto
+    a free key, or onto a key another changed row is leaving, but not onto a
+    row that stays. Moved rows are deleted, then every new version is written.
+  - SET expressions all see the old row, so `SET a = b, b = a` swaps.
+
+  As a result a statement that fails changes nothing, unless the disk itself
+  fails mid-write. That last case needs the WAL and transactions.
+- Every statement that changes data is flushed to disk when it finishes, so
+  closing the prompt or killing it between statements loses nothing.
+- The tracer gets `Statement { sql }` when a statement starts and
+  `StatementDone { summary }` when it finishes.
+
+### SQL test files
+
+`tests/sql/*.test` are run by `crates/core/tests/sql_files.rs` against a real
+database file in a temporary directory.
+
+```text
+statement ok              # must succeed
+CREATE TABLE t (a INT)
+
+statement error no such   # must fail with a message containing the text
+SELECT * FROM missing
+
+query                     # output must match the lines after ----
+SELECT a FROM t
+----
+a
+
+restart                   # close and reopen from the file on disk
+```
+
+`basics.test` is Phase 3's done-when check. It runs 54 statements covering
+every statement kind, with two `restart`s, and repeats the same queries after
+each restart. The harness fails if it ever drops below 50 statements.
+`expressions.test` covers operators and NULL logic. `errors.test` checks
+error messages, and that failed statements write nothing.
 
 ## Continuous integration
 

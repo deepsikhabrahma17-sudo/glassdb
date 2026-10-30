@@ -1,0 +1,87 @@
+# Expression rules: precedence, numbers, NULL logic and the errors they raise.
+
+query
+SELECT 1 + 2 * 3, (1 + 2) * 3, 10 - 2 - 3, 2 * -3
+----
+1 + 2 * 3 | (1 + 2) * 3 | 10 - 2 - 3 | 2 * -3
+7 | 9 | 5 | -6
+
+# Integer division truncates toward zero; a REAL anywhere makes the result REAL.
+query
+SELECT 7 / 2, -7 / 2, 7 % 3, -7 % 3, 7.0 / 2, 1.5e3
+----
+7 / 2 | -7 / 2 | 7 % 3 | -7 % 3 | 7.0 / 2 | 1500.0
+3 | -3 | 1 | -1 | 3.5 | 1500.0
+
+query
+SELECT 0.1 + 0.2, 2 = 2.0, 1 + 2.5
+----
+0.1 + 0.2 | 2 = 2.0 | 1 + 2.5
+0.30000000000000004 | true | 3.5
+
+query
+SELECT 'abc' < 'abd', 'b' > 'abc', 1 <> 2, 3 >= 4, 3 != 3
+----
+'abc' < 'abd' | 'b' > 'abc' | 1 <> 2 | 3 >= 4 | 3 <> 3
+true | true | true | false | false
+
+# Three-valued logic: NULL means "unknown".
+query
+SELECT NULL AND FALSE, NULL AND TRUE, NULL OR TRUE, NULL OR FALSE, NOT NULL
+----
+NULL AND FALSE | NULL AND TRUE | NULL OR TRUE | NULL OR FALSE | NOT NULL
+false | NULL | true | NULL | NULL
+
+query
+SELECT NULL = NULL, NULL IS NULL, 1 IS NOT NULL, NULL + 1, -NULL
+----
+NULL = NULL | NULL IS NULL | 1 IS NOT NULL | NULL + 1 | -NULL
+NULL | true | true | NULL | NULL
+
+query
+SELECT NOT TRUE, NOT FALSE AND TRUE, NOT (FALSE AND TRUE)
+----
+NOT TRUE | NOT FALSE AND TRUE | NOT (FALSE AND TRUE)
+false | true | true
+
+query
+SELECT -9223372036854775808, 9223372036854775807
+----
+-9223372036854775808 | 9223372036854775807
+-9223372036854775808 | 9223372036854775807
+
+query
+SELECT 'it''s', 'x' AS letter
+----
+'it''s' | letter
+it's | x
+
+statement error division by zero
+SELECT 1 / 0
+
+statement error division by zero
+SELECT 5 % 0
+
+statement error division by zero
+SELECT 1.0 / 0
+
+statement error integer overflow
+SELECT 9223372036854775807 + 1
+
+statement error integer overflow
+SELECT -(-9223372036854775808)
+
+statement error integer too large
+SELECT 9223372036854775808
+
+statement error cannot compare INT and TEXT
+SELECT 1 = 'one'
+
+statement error cannot apply + to TEXT and INT
+SELECT 'a' + 1
+
+statement error NOT needs a BOOL, got INT
+SELECT NOT 1
+
+statement error AND needs BOOL values, got INT
+SELECT TRUE AND 1

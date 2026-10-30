@@ -46,6 +46,11 @@ pub enum Event {
     /// The root had a single child, which was copied into the root page and
     /// freed. The tree shrank one level.
     RootShrink { root: PageId, child: PageId },
+
+    /// A SQL statement started running (shown as tidy, canonical SQL).
+    Statement { sql: String },
+    /// The statement finished: a summary such as "inserted 2 rows" or "error: ...".
+    StatementDone { summary: String },
 }
 
 /// Receives engine events. The default method ignores them.

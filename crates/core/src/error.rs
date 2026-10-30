@@ -24,6 +24,14 @@ pub enum Error {
     DatabaseFull,
     /// A B+ tree entry over the size limits (`MAX_KEY`, `MAX_ENTRY`).
     EntryTooLarge { key_len: usize, value_len: usize },
+    /// SQL that doesn't parse. `line` and `column` (1-based) point at the problem.
+    Syntax {
+        message: String,
+        line: usize,
+        column: usize,
+    },
+    /// SQL that parses but can't run: unknown table, wrong type, and so on.
+    Query(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -43,6 +51,12 @@ impl fmt::Display for Error {
                 "entry too large: key {key_len} bytes, value {value_len} bytes \
                  (limits: key {MAX_KEY}, key + value {MAX_ENTRY})"
             ),
+            Error::Syntax {
+                message,
+                line,
+                column,
+            } => write!(f, "syntax error at {line}:{column}: {message}"),
+            Error::Query(msg) => write!(f, "{msg}"),
         }
     }
 }

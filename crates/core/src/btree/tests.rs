@@ -320,3 +320,25 @@ fn dump_shows_the_tree() {
          page 2 leaf: k0002 k0003 k0004 → end\n"
     );
 }
+
+#[test]
+fn last_returns_the_largest_entry() {
+    let (mut pager, tree, _) = setup();
+    assert_eq!(tree.last(&mut pager).unwrap(), None);
+    for i in (0..50).rev() {
+        tree.insert(&mut pager, &key(i), &big(i as u8)).unwrap();
+    }
+    assert!(tree.check(&mut pager).unwrap().height >= 2);
+    assert_eq!(tree.last(&mut pager).unwrap(), Some((key(49), big(49))));
+}
+
+#[test]
+fn destroy_frees_every_page_including_the_root() {
+    let (mut pager, tree, _) = setup();
+    for i in 0..100 {
+        tree.insert(&mut pager, &key(i), &big(1)).unwrap();
+    }
+    tree.destroy(&mut pager).unwrap();
+    // Only the header page is still in use.
+    assert_eq!(pager.free_count(), pager.page_count() - 1);
+}

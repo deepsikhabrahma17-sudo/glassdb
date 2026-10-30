@@ -24,7 +24,7 @@ use crate::trace::Event;
 pub use check::TreeStats;
 pub use cursor::Range;
 use modify::{Change, Outcome, modify};
-use node::Node;
+use node::{Entry, Node};
 pub use node::{MAX_ENTRY, MAX_KEY};
 
 pub struct BTree {
@@ -81,6 +81,25 @@ impl BTree {
         Ok(old)
     }
 
+    /// The entry with the largest key, if any.
+    pub fn last(&self, pager: &mut Pager) -> Result<Option<Entry>> {
+        let mut page = self.root;
+        loop {
+            match read_node(pager, page)? {
+                Node::Internal { children, .. } => {
+                    page = *children.last().expect("internal node has a child")
+                }
+                // Only the root can be an empty leaf, so this is the true last entry.
+                Node::Leaf { mut entries, .. } => return Ok(entries.pop()),
+            }
+        }
+    }
+
+    /// Free every page of the tree, root included. The tree is gone afterwards.
+    pub fn destroy(self, pager: &mut Pager) -> Result<()> {
+        free_subtree(pager, self.root)
+    }
+
     /// The root has no parent to repair it, so it is handled here, keeping
     /// its page id fixed.
     fn fix_root(&self, pager: &mut Pager, outcome: Outcome) -> Result<()> {
@@ -122,6 +141,15 @@ impl BTree {
         }
         Ok(())
     }
+}
+
+fn free_subtree(pager: &mut Pager, page: PageId) -> Result<()> {
+    if let Node::Internal { children, .. } = read_node(pager, page)? {
+        for child in children {
+            free_subtree(pager, child)?;
+        }
+    }
+    pager.free(page)
 }
 
 /// Which child of an internal node can hold `key`: the number of separator

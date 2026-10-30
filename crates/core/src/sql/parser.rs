@@ -1,0 +1,307 @@
+//! A recursive-descent parser for statements. Expressions are in `expr.rs`.
+//!
+//! Each grammar rule is one method, so the code reads like the grammar:
+//!
+//! ```text
+//! create := CREATE TABLE [IF NOT EXISTS] name ( column {, column} )
+//! column := name type [PRIMARY KEY]
+//! drop   := DROP TABLE [IF EXISTS] name
+//! insert := INSERT INTO name [( name {, name} )] VALUES row {, row}
+//! select := SELECT item {, item} [FROM name] [WHERE expr]
+//!           [ORDER BY expr [ASC|DESC] {, ...}] [LIMIT expr [OFFSET expr]]
+//! update := UPDATE name SET name = expr {, name = expr} [WHERE expr]
+//! delete := DELETE FROM name [WHERE expr]
+//! ```
+
+use super::ast::{ColumnDef, CreateTable, OrderBy, Select, SelectItem, Statement};
+use super::token::{Keyword, Spanned, Token, tokenize};
+use crate::error::{Error, Result};
+use crate::types::DataType;
+
+/// Parse any number of statements separated by `;`.
+pub fn parse(sql: &str) -> Result<Vec<Statement>> {
+    let mut parser = Parser {
+        tokens: tokenize(sql)?,
+        pos: 0,
+    };
+    let mut statements = Vec::new();
+    loop {
+        while parser.eat(&Token::Semicolon) {}
+        if parser.peek() == &Token::Eof {
+            return Ok(statements);
+        }
+        statements.push(parser.statement()?);
+        if parser.peek() != &Token::Eof {
+            parser.expect(&Token::Semicolon, "';' or end of input")?;
+        }
+    }
+}
+
+/// Parse exactly one statement (a trailing `;` is fine).
+pub fn parse_one(sql: &str) -> Result<Statement> {
+    let mut statements = parse(sql)?;
+    match statements.len() {
+        1 => Ok(statements.remove(0)),
+        n => Err(Error::Syntax {
+            message: format!("expected one statement, found {n}"),
+            line: 1,
+            column: 1,
+        }),
+    }
+}
+
+pub(super) struct Parser {
+    tokens: Vec<Spanned>,
+    pos: usize,
+}
+
+impl Parser {
+    pub(super) fn peek(&self) -> &Token {
+        &self.tokens[self.pos].token
+    }
+
+    /// Move past the current token (never past `Eof`).
+    pub(super) fn advance(&mut self) {
+        if self.peek() != &Token::Eof {
+            self.pos += 1;
+        }
+    }
+
+    pub(super) fn eat(&mut self, token: &Token) -> bool {
+        let found = self.peek() == token;
+        if found {
+            self.advance();
+        }
+        found
+    }
+
+    pub(super) fn eat_keyword(&mut self, keyword: Keyword) -> bool {
+        self.eat(&Token::Keyword(keyword))
+    }
+
+    pub(super) fn expect(&mut self, token: &Token, what: &str) -> Result<()> {
+        if self.eat(token) {
+            Ok(())
+        } else {
+            self.expected(what)
+        }
+    }
+
+    pub(super) fn expect_keyword(&mut self, keyword: Keyword) -> Result<()> {
+        self.expect(&Token::Keyword(keyword), &keyword.as_str())
+    }
+
+    /// A syntax error at the current token.
+    pub(super) fn error<T>(&self, message: String) -> Result<T> {
+        let at = &self.tokens[self.pos];
+        Err(Error::Syntax {
+            message,
+            line: at.line,
+            column: at.column,
+        })
+    }
+
+    /// "expected X, found Y" at the current token.
+    pub(super) fn expected<T>(&self, what: &str) -> Result<T> {
+        self.error(format!("expected {what}, found {}", self.peek()))
+    }
+
+    fn name(&mut self, what: &str) -> Result<String> {
+        match self.peek().clone() {
+            Token::Ident(name) => {
+                self.advance();
+                Ok(name)
+            }
+            _ => self.expected(what),
+        }
+    }
+
+    /// `item {, item}`, where each item is parsed by `one`.
+    fn comma_list<T>(&mut self, mut one: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<T>> {
+        let mut items = vec![one(self)?];
+        while self.eat(&Token::Comma) {
+            items.push(one(self)?);
+        }
+        Ok(items)
+    }
+
+    fn statement(&mut self) -> Result<Statement> {
+        match self.peek() {
+            Token::Keyword(Keyword::Create) => self.create_table(),
+            Token::Keyword(Keyword::Drop) => self.drop_table(),
+            Token::Keyword(Keyword::Insert) => self.insert(),
+            Token::Keyword(Keyword::Select) => self.select().map(Statement::Select),
+            Token::Keyword(Keyword::Update) => self.update(),
+            Token::Keyword(Keyword::Delete) => self.delete(),
+            _ => self.expected("a statement (CREATE, DROP, INSERT, SELECT, UPDATE or DELETE)"),
+        }
+    }
+
+    fn create_table(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Create)?;
+        self.expect_keyword(Keyword::Table)?;
+        let if_not_exists = self.eat_keyword(Keyword::If);
+        if if_not_exists {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+        }
+        let name = self.name("a table name")?;
+        self.expect(&Token::LParen, "'('")?;
+        let columns = self.comma_list(Self::column_def)?;
+        self.expect(&Token::RParen, "')' or ','")?;
+        Ok(Statement::CreateTable(CreateTable {
+            name,
+            if_not_exists,
+            columns,
+        }))
+    }
+
+    fn column_def(&mut self) -> Result<ColumnDef> {
+        let name = self.name("a column name")?;
+        // Type names are ordinary words, so a column can still be called `text`.
+        let data_type = match self.peek().clone() {
+            Token::Ident(word) => match word.as_str() {
+                "int" | "integer" => DataType::Int,
+                "real" => DataType::Real,
+                "text" => DataType::Text,
+                "bool" | "boolean" => DataType::Bool,
+                _ => {
+                    return self
+                        .error(format!("unknown type {word} (use INT, REAL, TEXT or BOOL)"));
+                }
+            },
+            _ => return self.expected("a column type"),
+        };
+        self.advance();
+        let primary_key = self.eat_keyword(Keyword::Primary);
+        if primary_key {
+            self.expect_keyword(Keyword::Key)?;
+        }
+        Ok(ColumnDef {
+            name,
+            data_type,
+            primary_key,
+        })
+    }
+
+    fn drop_table(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Drop)?;
+        self.expect_keyword(Keyword::Table)?;
+        let if_exists = self.eat_keyword(Keyword::If);
+        if if_exists {
+            self.expect_keyword(Keyword::Exists)?;
+        }
+        let name = self.name("a table name")?;
+        Ok(Statement::DropTable { name, if_exists })
+    }
+
+    fn insert(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Insert)?;
+        self.expect_keyword(Keyword::Into)?;
+        let table = self.name("a table name")?;
+        let columns = if self.eat(&Token::LParen) {
+            let columns = self.comma_list(|p| p.name("a column name"))?;
+            self.expect(&Token::RParen, "')' or ','")?;
+            Some(columns)
+        } else {
+            None
+        };
+        self.expect_keyword(Keyword::Values)?;
+        let rows = self.comma_list(|p| {
+            p.expect(&Token::LParen, "'('")?;
+            let row = p.comma_list(Self::expr)?;
+            p.expect(&Token::RParen, "')' or ','")?;
+            Ok(row)
+        })?;
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
+    }
+
+    fn select(&mut self) -> Result<Select> {
+        self.expect_keyword(Keyword::Select)?;
+        let items = self.comma_list(Self::select_item)?;
+        let from = if self.eat_keyword(Keyword::From) {
+            Some(self.name("a table name")?)
+        } else {
+            None
+        };
+        let filter = self.where_clause()?;
+        let mut order_by = Vec::new();
+        if self.eat_keyword(Keyword::Order) {
+            self.expect_keyword(Keyword::By)?;
+            order_by = self.comma_list(|p| {
+                let expr = p.expr()?;
+                let descending = p.eat_keyword(Keyword::Desc);
+                if !descending {
+                    p.eat_keyword(Keyword::Asc);
+                }
+                Ok(OrderBy { expr, descending })
+            })?;
+        }
+        let (mut limit, mut offset) = (None, None);
+        if self.eat_keyword(Keyword::Limit) {
+            limit = Some(self.expr()?);
+            if self.eat_keyword(Keyword::Offset) {
+                offset = Some(self.expr()?);
+            }
+        }
+        Ok(Select {
+            items,
+            from,
+            filter,
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
+    fn select_item(&mut self) -> Result<SelectItem> {
+        if self.eat(&Token::Star) {
+            return Ok(SelectItem::Wildcard);
+        }
+        let expr = self.expr()?;
+        // `expr AS name`, or just `expr name`.
+        let alias = if self.eat_keyword(Keyword::As) || matches!(self.peek(), Token::Ident(_)) {
+            Some(self.name("a column alias")?)
+        } else {
+            None
+        };
+        Ok(SelectItem::Expr { expr, alias })
+    }
+
+    fn update(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Update)?;
+        let table = self.name("a table name")?;
+        self.expect_keyword(Keyword::Set)?;
+        let assignments = self.comma_list(|p| {
+            let column = p.name("a column name")?;
+            p.expect(&Token::Eq, "'='")?;
+            Ok((column, p.expr()?))
+        })?;
+        let filter = self.where_clause()?;
+        Ok(Statement::Update {
+            table,
+            assignments,
+            filter,
+        })
+    }
+
+    fn delete(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Delete)?;
+        self.expect_keyword(Keyword::From)?;
+        let table = self.name("a table name")?;
+        let filter = self.where_clause()?;
+        Ok(Statement::Delete { table, filter })
+    }
+
+    fn where_clause(&mut self) -> Result<Option<super::ast::Expr>> {
+        if self.eat_keyword(Keyword::Where) {
+            Ok(Some(self.expr()?))
+        } else {
+            Ok(None)
+        }
+    }
+}
