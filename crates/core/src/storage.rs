@@ -17,6 +17,8 @@ pub trait Storage: Send {
     /// Write `data` at `offset`, growing the storage if needed.
     /// Any gap before `offset` reads back as zeros.
     fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()>;
+    /// Cut the storage down to `len` bytes.
+    fn truncate(&mut self, len: u64) -> Result<()>;
     /// Current size in bytes.
     fn size(&mut self) -> Result<u64>;
     /// Make every write so far durable (fsync for files).
@@ -60,6 +62,11 @@ impl Storage for FileStorage {
         // Writing past the end leaves a gap that the OS fills with zeros.
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(data)?;
+        Ok(())
+    }
+
+    fn truncate(&mut self, len: u64) -> Result<()> {
+        self.file.set_len(len)?;
         Ok(())
     }
 
@@ -112,6 +119,11 @@ impl Storage for MemStorage {
         Ok(())
     }
 
+    fn truncate(&mut self, len: u64) -> Result<()> {
+        self.bytes.lock().unwrap().truncate(len as usize);
+        Ok(())
+    }
+
     fn size(&mut self) -> Result<u64> {
         Ok(self.bytes.lock().unwrap().len() as u64)
     }
@@ -145,6 +157,11 @@ mod tests {
         storage.write_at(0, b"ab").unwrap();
         assert_eq!(storage.size().unwrap(), 15, "overwrite does not grow");
         storage.sync().unwrap();
+
+        storage.truncate(12).unwrap();
+        assert_eq!(storage.size().unwrap(), 12);
+        let mut past_end = [0u8; 4];
+        assert!(storage.read_at(10, &mut past_end).is_err());
     }
 
     #[test]
@@ -167,8 +184,8 @@ mod tests {
         check_contract(&mut FileStorage::open(&path).unwrap());
 
         let mut reopened = FileStorage::open(&path).unwrap();
-        let mut buf = [0u8; 5];
+        let mut buf = [0u8; 2];
         reopened.read_at(10, &mut buf).unwrap();
-        assert_eq!(&buf, b"hello");
+        assert_eq!(&buf, b"he", "the bytes left by the truncate");
     }
 }

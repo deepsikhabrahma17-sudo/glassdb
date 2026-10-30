@@ -47,6 +47,22 @@ pub enum Event {
     /// freed. The tree shrank one level.
     RootShrink { root: PageId, child: PageId },
 
+    /// A changed page was appended to the log.
+    WalAppend { page: PageId },
+    /// A page was read from the log, because the main file's copy is out of date.
+    WalRead { page: PageId },
+    /// A transaction's commit record reached disk: it now survives any crash.
+    WalCommit { frames: u32 },
+    /// The log's pages were copied into the main file and the log was emptied.
+    Checkpoint { pages: u32 },
+    /// Opening found a log left by a crash. `transactions` and `frames` were
+    /// kept; `discarded` frames after the last commit record were thrown away.
+    WalRecovered {
+        transactions: usize,
+        frames: usize,
+        discarded: usize,
+    },
+
     /// A SQL statement started running (shown as tidy, canonical SQL).
     Statement { sql: String },
     /// The statement finished: a summary such as "inserted 2 rows" or "error: ...".

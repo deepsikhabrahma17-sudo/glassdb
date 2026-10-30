@@ -25,8 +25,8 @@ glassdb <database-file>
 ```
 
 - With no file argument, it prints usage to stderr and exits with code 2.
-- It opens the file, or creates a new database (header page and empty
-  catalog). Then it prints a banner with the version, the file name and the
+- It opens the file and its log, or creates a new database (header page and
+  empty catalog). Then it prints a banner with the version, the file name and the
   table count. A file that isn't a GlassDB database is reported and left
   untouched (exit code 1).
 - **Input** collects lines until the text ends with a `;` that isn't inside a
@@ -39,7 +39,8 @@ glassdb <database-file>
   - Other statements print a line, such as `inserted 2 rows`.
   - Errors go to stderr as `error: …`, and the session carries on.
 - **Dot commands** (only at the start of a statement): `.tables`,
-  `.schema [table]`, `.help`, `.exit` / `.quit`.
+  `.schema [table]`, `.check`, `.checkpoint`, `.help`, `.exit` / `.quit`.
+- **After a crash**, the banner says how many transactions were recovered from the log.
 - **Keys:** Ctrl-C drops a half-typed statement. Ctrl-D (end of input) runs
   anything left unfinished, then exits with code 0. So `glassdb my.db < script.sql` works.
 - **Code layout:** `repl.rs` (statement buffering) and `render.rs` (tables)
@@ -49,8 +50,8 @@ glassdb <database-file>
 
 ## Storage
 
-The pager reads and writes through a `Storage` trait (`read_at`, `write_at`,
-`size`, `sync`), not through `File` directly.
+The pager and the log read and write through a `Storage` trait (`read_at`,
+`write_at`, `truncate`, `size`, `sync`), not through `File` directly.
 
 - `FileStorage` is a real file, used by the CLI.
 - `MemStorage` is a `Vec<u8>` behind `Arc<Mutex<…>>`. Clones share the same bytes, so a
@@ -87,8 +88,8 @@ On open, the header is rejected if any of these hold:
 A non-empty file shorter than one page is `BadMagic` if it doesn't start with the
 magic (it was never a database, e.g. a text file), and `Corrupt` if it does.
 The file must be at least `page count × 4096` bytes. A **longer** file is
-accepted and its tail ignored (a flush can stop after writing pages but before
-updating the header). A **shorter** file has lost pages and is reported as corrupt.
+accepted and its tail ignored. A **shorter** file has lost pages and is reported as
+corrupt. Both checks run after recovery, so pages still in the log don't count as lost.
 
 ### Free list
 
@@ -111,6 +112,11 @@ corrupts the list. That is the caller's job to avoid, and the B+ tree is the onl
 
 ## Pager and buffer cache
 
+A pager opens in one of two ways. `open_with_wal` is crash safe and is what
+`Database` uses. `open` has no log and writes straight to the main file; the
+lower-level tests and tours use it because it's simpler and faster. This section
+describes what both share, and the Write-ahead log section covers the rest.
+
 The `Pager` owns page 0. Callers use pages `1..page_count`, and touching page 0
 or anything past the end is `PageOutOfRange`.
 
@@ -132,11 +138,13 @@ least-recently-used (LRU) eviction:
   The new page is then read into the victim's reused buffer. `write_page` skips
   the read, since it replaces the whole page.
 
-**Flush** writes the dirty pages in ascending page order, then the header (if
-changed), then calls `sync`. Pages go before the header so the header never
-counts pages that aren't in the file yet. `close()` flushes. Dropping a pager
-without `close()` discards unflushed changes on purpose: hidden writes would get
-in the way of the crash tests. Real crash safety comes from the write-ahead log.
+**Flush without a log** writes the dirty pages in ascending page order, then the
+header (if changed), then calls `sync`. Pages go before the header so the header
+never counts pages that aren't in the file yet.
+
+**Dropping a pager** without `close()` discards everything since the last flush,
+just as a crash would. There are no hidden writes, which is what lets tests
+simulate a crash by dropping one.
 
 ## Tracer
 
@@ -161,6 +169,19 @@ the victim's `PageWrite`, then `PageRead`. The visualizer can replay that order 
 each event costs one call to an empty function, which is tiny next to any I/O.
 A generic `Tracer` parameter would cost nothing at all, but every type above
 the pager would have to carry it (`BTree<T>`, `Engine<T>`, …).
+
+Log events:
+
+| Event | When |
+| --- | --- |
+| `WalAppend { page }` | A changed page was appended to the log |
+| `WalRead { page }` | A page was read from the log, because the main file's copy is out of date |
+| `WalCommit { frames }` | A commit record reached disk: the transaction now survives any crash |
+| `Checkpoint { pages }` | The log's pages were copied into the main file and the log was emptied |
+| `WalRecovered { transactions, frames, discarded }` | Opening found a log left by a crash |
+
+With a log, an evicted dirty page sends `WalAppend` instead of `PageWrite`, and a
+page found in the log sends `WalRead` instead of `PageRead`.
 
 B+ tree events (the tree reaches the shared tracer through `pager.tracer()`):
 
@@ -312,6 +333,144 @@ the tree cannot change during a scan.
   - searching left on a key equal to a separator
   - never rebalancing underfull nodes
   - treating an exclusive range end as inclusive
+
+## Write-ahead log
+
+**The rule:** a transaction counts only once its commit record is on disk. Each
+statement is one transaction for now. Anything after the last valid commit
+record is thrown away on recovery, so after a crash a statement is either wholly
+there or not there at all.
+
+`my.db` keeps its log in `my.db-wal`, beside it. The log file exists while the
+database is open, and after a crash. A clean close removes it.
+
+### The write path
+
+1. A statement changes pages in the cache.
+2. If the cache fills, a changed page is appended to the log as an uncommitted
+   frame, and can be read back from there. It never goes to the main file.
+3. When the statement finishes, `Pager::flush` appends the remaining changed
+   pages, then the header page if it changed.
+4. A commit record is appended and the log is forced to disk with `sync`. Only
+   now does the statement count as done.
+5. The main file is still untouched. A later checkpoint updates it.
+
+A read looks in the cache, then the log, then the main file. In the log, the
+running transaction's frames are checked first, then committed frames, and the
+newest frame of a page wins.
+
+**Decision: the main file changes only during a checkpoint.** The alternative is
+writing each commit into the main file straight away and keeping the log only
+for redo. That needs no log lookup on reads. But then a statement bigger than the
+cache has nowhere to put its pages before it commits, and it would make `ROLLBACK`
+harder. Here, an unfinished statement only ever exists in the log, so undoing it
+just means forgetting those frames.
+
+**The header page is logged like any other page**, so page count and free-list
+changes commit together with the data. A new database is created the same way:
+nothing reaches the main file until the first checkpoint. A crash during creation
+therefore leaves an empty file, never a broken one.
+
+### File format
+
+All integers are little-endian. The file starts with a 16-byte header:
+
+| Bytes | Field |
+| --- | --- |
+| 0–8 | magic `GLASSWAL` |
+| 8–12 | format version (`1`) |
+| 12–16 | zero |
+
+Then records, one after another:
+
+| Bytes | Field |
+| --- | --- |
+| 0 | kind: `1` = page frame, `2` = commit |
+| 1–4 | zero |
+| 4–8 | page frame: page id; commit: number of frames in this transaction |
+| 8–12 | checksum |
+| 12– | page frame only: the 4096-byte page |
+
+**Decision: checksums are chained.** Each record's CRC32 covers the previous
+record's checksum as well as its own bytes (the first starts from 0). A record
+is therefore only valid in its exact place in the log, so a torn, damaged or
+out-of-order record fails the check. It also means the commit record vouches for
+the whole transaction: a bad frame makes the commit's checksum fail too.
+
+### Recovery
+
+On open, the log is scanned from the start. Frames are held back until a valid
+commit record arrives, and the scan stops at the first record that is incomplete
+or fails its checksum. Every committed page is copied into the main file, the
+main file is synced, and the log is emptied. Frames after the last commit are
+thrown away. The `WalRecovered` event and `Database::recovered()` report the result.
+
+A log with a damaged header can't hold anything committed, because a commit is
+only synced after the header. So a bad magic, or a version of 0 from a header torn
+part-way, counts as an empty log. A valid header with a newer version is refused.
+
+### Checkpoint
+
+`copy_log_to_main` copies the newest committed version of each page into the main
+file, syncs the main file, then empties the log (truncate, then sync).
+
+**The order is what makes it safe.** The log is emptied only after the main file
+is synced. If a crash lands anywhere in the checkpoint, the log is still complete
+and the next open simply copies the pages again. Copying a page twice is harmless.
+
+A checkpoint happens on open (as part of recovery), on clean close, when a commit
+leaves the log with 1,000 or more frames (`CHECKPOINT_FRAMES`, about 4 MB), and on
+demand with `.checkpoint`.
+
+### Other details
+
+- **Folder sync:** `Database::open` syncs the database's folder after creating
+  the log file. Otherwise a crash could lose the file's name and everything
+  committed to it. It's best effort, because not every system can sync a folder.
+- **Existing databases** open normally: the main file format is unchanged.
+- **Verification:** `Database::check` (`.check` in the CLI) verifies every B+ tree,
+  decodes every row, walks the free list, and confirms that used pages + free
+  pages = pages in the file. So a leaked page counts as corruption.
+
+### Limits
+
+- **Two programs on one file** aren't protected against each other yet.
+- **Disk errors while running:** if a write fails with an I/O error, the session
+  should be closed and reopened.
+- **Speed:** every statement waits for a `sync`, so writes are limited by the
+  disk. Grouping statements into one commit needs `BEGIN`/`COMMIT`.
+
+### Crash testing
+
+- **Unit tests** (`wal/tests.rs`, `pager/wal_tests.rs`): the exact byte layout, a
+  log cut at every byte position, a header torn at every byte, flipped bits,
+  swapped frames, and spilled pages.
+- **Simulated power cuts** (`crates/core/tests/crash_sim.rs`): killing a process
+  can't show what a power cut does, because the operating system still finishes
+  every write it was handed. This test's fake disk does. Anything written since
+  the last sync may survive whole, survive torn, or be lost, chosen at random
+  for each write. A 55-step workload runs and the power is cut at every one of
+  its 417 disk operations, with 3 seeds. Sometimes the power fails again during
+  recovery. After each cut the database must open, pass `check`, and hold exactly
+  the state after the last confirmed step, or after the one in flight.
+- **Real kills, the done-when check** (`crates/cli/tests/crash.rs`): the real
+  `glassdb` binary runs a stream of statements with `.checkpoint` mixed in and
+  gets SIGKILL at a random moment, 200 times, on one growing database. After every
+  kill: `check` must pass, every confirmed statement must be there, every INSERT
+  batch must be whole, and an UPDATE of all rows must have reached all of them.
+- **Guarding the tests:** each of these bugs was planted once and made a test fail:
+  - commit doesn't sync the log
+  - recovery ignores checksums
+  - uncommitted frames count as committed
+  - a checkpoint empties the log before the main file is synced
+  - a dirty page evicted straight into the main file
+
+  Removing only the frame's checksum check caught nothing, which is expected: the
+  chained commit checksum still rejects the transaction.
+
+The power-cut test found a real bug while it was being built. The log header can
+tear between the magic and the version, and recovery read that as "unsupported
+version 0" and refused to open the database.
 
 ## SQL
 
@@ -472,10 +631,9 @@ or `Rows { columns, rows }`.
     row that stays. Moved rows are deleted, then every new version is written.
   - SET expressions all see the old row, so `SET a = b, b = a` swaps.
 
-  As a result a statement that fails changes nothing, unless the disk itself
-  fails mid-write. That last case needs the WAL and transactions.
-- Every statement that changes data is flushed to disk when it finishes, so
-  closing the prompt or killing it between statements loses nothing.
+  As a result a statement that fails with an error changes nothing.
+- Every statement that changes data commits to the write-ahead log when it
+  finishes. A crash at any moment keeps it whole or loses it whole.
 - The tracer gets `Statement { sql }` when a statement starts and
   `StatementDone { summary }` when it finishes.
 

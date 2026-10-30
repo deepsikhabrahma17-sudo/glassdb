@@ -127,6 +127,34 @@ fn dot_commands() {
 }
 
 #[test]
+fn check_and_checkpoint_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = session(
+        &dir.path().join("test.db"),
+        "CREATE TABLE t (a INT);\nINSERT INTO t VALUES (1);\n.check\n.checkpoint\n",
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(stdout.contains("ok: 1 table, 1 row"), "{stdout}");
+    assert!(stdout.contains("checkpoint done"), "{stdout}");
+}
+
+#[test]
+fn the_banner_mentions_recovered_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let mut db = glassdb_core::Database::open(&db_path).unwrap();
+    db.execute("CREATE TABLE t (a INT)").unwrap();
+    drop(db); // a crash: never closed
+
+    let (stdout, _) = session(&db_path, "SELECT a FROM t;\n");
+    assert!(stdout.contains("recovered 2 transactions"), "{stdout}");
+    assert!(
+        !dir.path().join("test.db-wal").exists(),
+        "a clean exit removes the log"
+    );
+}
+
+#[test]
 fn end_of_input_runs_an_unfinished_statement_and_exits() {
     let dir = tempfile::tempdir().unwrap();
     let (stdout, _) = session(&dir.path().join("test.db"), "SELECT 7 AS last");

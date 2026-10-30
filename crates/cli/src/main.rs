@@ -17,6 +17,8 @@ Enter SQL statements ending with ';'. Statements can span several lines.
 Commands:
   .tables          list the tables
   .schema [name]   show CREATE TABLE statements
+  .check           verify the whole database
+  .checkpoint      move the log's pages into the main file
   .help            show this help
   .exit            leave (Ctrl-D works too)";
 
@@ -37,6 +39,11 @@ fn main() -> ExitCode {
     let tables = db.tables().map(|t| t.len()).unwrap_or(0);
     let unit = if tables == 1 { "table" } else { "tables" };
     println!("GlassDB {VERSION} — {path} ({tables} {unit})");
+    match db.recovered() {
+        0 => {}
+        1 => println!("recovered 1 transaction from the log"),
+        n => println!("recovered {n} transactions from the log"),
+    }
     println!("Enter SQL ending with \";\", or .help for commands.");
 
     // rustyline gives line editing and history on a terminal, and falls back
@@ -130,6 +137,16 @@ fn run_command(db: &mut Database, command: &str) {
                 }
             })
         }
+        ".check" => db.check().map(|report| {
+            println!(
+                "ok: {}, {}, {} ({} free)",
+                count(report.tables, "table"),
+                count(report.rows, "row"),
+                count(report.pages as usize, "page"),
+                report.free_pages
+            );
+        }),
+        ".checkpoint" => db.checkpoint().map(|()| println!("checkpoint done")),
         ".help" => {
             println!("{HELP}");
             Ok(())
@@ -141,5 +158,13 @@ fn run_command(db: &mut Database, command: &str) {
     };
     if let Err(err) = result {
         eprintln!("error: {err}");
+    }
+}
+
+fn count(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
     }
 }

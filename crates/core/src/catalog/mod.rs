@@ -136,6 +136,12 @@ impl Catalog {
         Ok(schema)
     }
 
+    /// Verify the catalog's own tree. Returns how many pages it uses.
+    pub fn check(&self, pager: &mut Pager) -> Result<usize> {
+        let stats = self.tree.check(pager)?;
+        Ok(stats.internal_nodes + stats.leaves)
+    }
+
     /// Remove a table and free all of its pages. Returns it, if it existed.
     pub fn drop(&self, pager: &mut Pager, name: &str) -> Result<Option<TableSchema>> {
         let Some(schema) = self.get(pager, name)? else {

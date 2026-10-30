@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::storage::MemStorage;
-use crate::trace::{Event, RecordingTracer};
+use crate::trace::{Event, NoopTracer, RecordingTracer};
 
 /// Open a pager on `disk` with `frames` cache frames and a recording tracer.
 fn open(disk: &MemStorage, frames: usize) -> (Pager, Arc<RecordingTracer>) {

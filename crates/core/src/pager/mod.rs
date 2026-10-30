@@ -4,22 +4,31 @@
 //! use pages 1..page_count. Pages are copied in and out: `read_page` returns
 //! an owned copy and `write_page` copies it back, so callers never hold a
 //! borrow into the cache.
+//!
+//! With a write-ahead log (`open_with_wal`), the main file changes only during
+//! a checkpoint. A read looks in the cache, then the log, then the main file.
+//! A changed page that must leave the cache goes to the log, and `flush`
+//! commits. Without a log (`open`), pages go straight to the main file, which
+//! is simpler and faster but not crash safe; the lower-level tests use it.
 
 pub mod cache;
 pub mod header;
+mod open;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wal_tests;
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::bytes::{get_u32, put_u32};
 use crate::error::{Error, Result};
-use crate::storage::{FileStorage, Storage};
-use crate::trace::{Event, NoopTracer, Tracer};
+use crate::storage::Storage;
+use crate::trace::{Event, Tracer};
+use crate::wal::Wal;
 use cache::{Cache, Frame};
-use header::{Header, MAGIC};
+use header::Header;
 
 pub const PAGE_SIZE: usize = 4096;
 pub type PageId = u32;
@@ -28,6 +37,10 @@ pub type Page = [u8; PAGE_SIZE];
 /// Cache frames used by `Pager::open_file`: 256 × 4 KB = 1 MB.
 pub const DEFAULT_CACHE_FRAMES: usize = 256;
 
+/// A commit that leaves the log this many frames long (about 4 MB) also
+/// checkpoints it, so the log can't grow without limit.
+pub const CHECKPOINT_FRAMES: u32 = 1000;
+
 pub struct Pager {
     storage: Box<dyn Storage>,
     /// In-memory copy of page 0; written back by `flush` when `header_dirty`.
@@ -35,70 +48,12 @@ pub struct Pager {
     header_dirty: bool,
     cache: Cache,
     tracer: Arc<dyn Tracer>,
+    wal: Option<Wal>,
+    /// Transactions found in the log when this pager opened.
+    recovered: usize,
 }
 
 impl Pager {
-    /// Open (or create) a database file with the default cache and no tracing.
-    pub fn open_file(path: impl AsRef<Path>) -> Result<Pager> {
-        let storage = FileStorage::open(path)?;
-        Pager::open(
-            Box::new(storage),
-            DEFAULT_CACHE_FRAMES,
-            Arc::new(NoopTracer),
-        )
-    }
-
-    /// Open a database on `storage`. Empty storage becomes a new database.
-    pub fn open(
-        mut storage: Box<dyn Storage>,
-        cache_frames: usize,
-        tracer: Arc<dyn Tracer>,
-    ) -> Result<Pager> {
-        let size = storage.size()?;
-        let header = if size == 0 {
-            // Brand-new file: write the header now so the file is valid at once.
-            let header = Header::new_database();
-            storage.write_at(0, &header.encode()[..])?;
-            storage.sync()?;
-            tracer.event(&Event::PageWrite { page: 0 });
-            header
-        } else {
-            if size < PAGE_SIZE as u64 {
-                // Too short for a header. If it doesn't even start with the
-                // magic, it was never a GlassDB file (say, a text file).
-                let mut start = vec![0u8; size.min(MAGIC.len() as u64) as usize];
-                storage.read_at(0, &mut start)?;
-                if start != MAGIC {
-                    return Err(Error::BadMagic);
-                }
-                return Err(Error::Corrupt(format!(
-                    "file is {size} bytes, smaller than one page"
-                )));
-            }
-            let mut page = Box::new([0u8; PAGE_SIZE]);
-            storage.read_at(0, &mut page[..])?;
-            tracer.event(&Event::PageRead { page: 0 });
-            let header = Header::decode(&page)?;
-            // A longer file is fine (a flush may have stopped before the
-            // header was updated); a shorter one has lost pages.
-            let needed = offset(header.page_count);
-            if size < needed {
-                return Err(Error::Corrupt(format!(
-                    "header says {} pages ({needed} bytes) but the file is {size} bytes",
-                    header.page_count
-                )));
-            }
-            header
-        };
-        Ok(Pager {
-            storage,
-            header,
-            header_dirty: false,
-            cache: Cache::new(cache_frames),
-            tracer,
-        })
-    }
-
     /// Number of pages, including the header page.
     pub fn page_count(&self) -> u32 {
         self.header.page_count
@@ -107,6 +62,30 @@ impl Pager {
     /// Number of pages on the free list.
     pub fn free_count(&self) -> u32 {
         self.header.free_count
+    }
+
+    /// How many committed transactions the log held when this pager opened.
+    /// More than zero means the last session ended without a clean close.
+    pub fn recovered(&self) -> usize {
+        self.recovered
+    }
+
+    /// Follow the free list and check it matches the header's count.
+    pub fn check_free_list(&mut self) -> Result<()> {
+        let mut page = self.header.free_head;
+        for _ in 0..self.header.free_count {
+            if page == 0 || page >= self.header.page_count {
+                return Err(Error::Corrupt(format!("free list reaches page {page}")));
+            }
+            page = get_u32(&self.read_page(page)?[..], 0);
+        }
+        if page != 0 {
+            return Err(Error::Corrupt(format!(
+                "free list is longer than its count of {}",
+                self.header.free_count
+            )));
+        }
+        Ok(())
     }
 
     /// The tracer every layer above the pager reports to.
@@ -174,8 +153,50 @@ impl Pager {
         Ok(())
     }
 
-    /// Write every changed page, then the header, then sync to disk.
+    /// Make every change so far durable. With a log, this commits a
+    /// transaction; without one, it writes straight to the main file.
     pub fn flush(&mut self) -> Result<()> {
+        let Some(wal) = &mut self.wal else {
+            return self.write_to_main();
+        };
+        for id in self.cache.dirty_pages() {
+            let frame = self.cache.peek_mut(id).expect("dirty page is cached");
+            wal.append_page(id, &frame.data)?;
+            frame.dirty = false;
+            self.tracer.event(&Event::WalAppend { page: id });
+        }
+        if self.header_dirty {
+            wal.append_page(0, &self.header.encode())?;
+            self.header_dirty = false;
+            self.tracer.event(&Event::WalAppend { page: 0 });
+        }
+        let frames = wal.commit()?;
+        if frames > 0 {
+            self.tracer.event(&Event::WalCommit { frames });
+        }
+        if wal.frames() >= CHECKPOINT_FRAMES {
+            copy_log_to_main(wal, self.storage.as_mut(), self.tracer.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Commit, then move the log's pages into the main file and empty the log.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        self.flush()?;
+        if let Some(wal) = &mut self.wal {
+            copy_log_to_main(wal, self.storage.as_mut(), self.tracer.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Checkpoint and close. Dropping a pager without `close` discards
+    /// everything since the last `flush`, just as a crash would.
+    pub fn close(mut self) -> Result<()> {
+        self.checkpoint()
+    }
+
+    /// Without a log: write every changed page, then the header, then sync.
+    fn write_to_main(&mut self) -> Result<()> {
         // Pages go before the header, so the header never counts pages that
         // are not in the file yet. Ascending order keeps the writes sequential.
         for id in self.cache.dirty_pages() {
@@ -190,11 +211,6 @@ impl Pager {
             self.tracer.event(&Event::PageWrite { page: 0 });
         }
         self.storage.sync()
-    }
-
-    /// Flush and close. Dropping a pager without `close` discards unflushed changes.
-    pub fn close(mut self) -> Result<()> {
-        self.flush()
     }
 
     fn check_range(&self, id: PageId) -> Result<()> {
@@ -223,12 +239,21 @@ impl Pager {
                     dirty: victim.dirty,
                 });
                 if victim.dirty {
-                    if let Err(err) = self.storage.write_at(offset(victim.page), &victim.data[..]) {
+                    // With a log this frame has no commit record yet, so a
+                    // crash drops it and the main file never sees it.
+                    let saved = match &mut self.wal {
+                        Some(wal) => wal.append_page(victim.page, &victim.data),
+                        None => self.storage.write_at(offset(victim.page), &victim.data[..]),
+                    };
+                    if let Err(err) = saved {
                         // Keep the unsaved page rather than lose it.
                         self.cache.insert(victim);
                         return Err(err);
                     }
-                    self.tracer.event(&Event::PageWrite { page: victim.page });
+                    self.tracer.event(&match self.wal {
+                        Some(_) => Event::WalAppend { page: victim.page },
+                        None => Event::PageWrite { page: victim.page },
+                    });
                 }
                 // Reuse the victim's buffer for the incoming page.
                 victim.data
@@ -236,8 +261,16 @@ impl Pager {
             None => Box::new([0; PAGE_SIZE]),
         };
         if read_from_disk {
-            self.storage.read_at(offset(id), &mut data[..])?;
-            self.tracer.event(&Event::PageRead { page: id });
+            let in_log = match &mut self.wal {
+                Some(wal) => wal.read(id, &mut data)?,
+                None => false,
+            };
+            if in_log {
+                self.tracer.event(&Event::WalRead { page: id });
+            } else {
+                self.storage.read_at(offset(id), &mut data[..])?;
+                self.tracer.event(&Event::PageRead { page: id });
+            }
         }
         self.cache.insert(Frame {
             page: id,
@@ -251,4 +284,24 @@ impl Pager {
 /// Byte offset of page `id` in the file.
 fn offset(id: PageId) -> u64 {
     u64::from(id) * PAGE_SIZE as u64
+}
+
+/// Copy every committed page from the log into the main file, then empty the
+/// log. The order is what makes a crash here safe: the log is only emptied
+/// after the main file is synced, so until then the log can redo everything.
+fn copy_log_to_main(wal: &mut Wal, storage: &mut dyn Storage, tracer: &dyn Tracer) -> Result<()> {
+    let pages = wal.pages();
+    let mut page = Box::new([0u8; PAGE_SIZE]);
+    for &id in &pages {
+        wal.read(id, &mut page)?;
+        storage.write_at(offset(id), &page[..])?;
+        tracer.event(&Event::PageWrite { page: id });
+    }
+    if !pages.is_empty() {
+        storage.sync()?;
+        tracer.event(&Event::Checkpoint {
+            pages: pages.len() as u32,
+        });
+    }
+    wal.reset()
 }

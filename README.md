@@ -25,8 +25,8 @@ together:
 
 > **Status:** early development. The storage engine (pager, buffer cache,
 > B+ tree) and a first SQL layer (tables, `SELECT`/`INSERT`/`UPDATE`/`DELETE`,
-> a catalog that survives restarts) work. Crash safety, transactions and
-> time travel are next. See the [roadmap](#roadmap).
+> a catalog that survives restarts) work, and a write-ahead log keeps them safe
+> through crashes. Transactions and time travel are next. See the [roadmap](#roadmap).
 
 ## Contents
 
@@ -66,7 +66,7 @@ glassdb> SELECT name, grade + 5 AS curved FROM students
 
 The prompt creates `my.db` if it doesn't exist, and everything is still there
 the next time you open it. Statements end with `;` and can span lines. Try
-`.tables`, `.schema` and `.help`, or run the demo script:
+`.tables`, `.schema`, `.check` and `.help`, or run the demo script:
 
 ```bash
 cargo run -p glassdb -- demo.db < examples/demo.sql
@@ -94,6 +94,13 @@ a freed page, closes, reopens, and dumps the raw header bytes from disk.
 ```
 
 ```bash
+cargo run -p glassdb-core --example wal_tour
+```
+
+The WAL tour commits to the log, tears a commit record in a fake crash, and
+shows recovery keeping whole transactions and dropping the torn one.
+
+```bash
 cargo run -p glassdb-core --example btree_tour
 ```
 
@@ -119,10 +126,11 @@ level, scans a range along the leaf chain, borrows, merges and shrinks back:
 | **B+ tree** | Byte-string keys and values in 4 KB slotted pages. Insert with leaf and internal splits, delete with merge or borrow, ordered range scans along linked leaves |
 | **SQL** | `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT … WHERE … ORDER BY … LIMIT … OFFSET`, `UPDATE`, `DELETE`. Types `INT`, `REAL`, `TEXT`, `BOOL` and SQL `NULL` logic. Errors point at the line and column |
 | **Catalog** | Table definitions live in their own B+ tree on page 1, so the schema survives restarts. `INT PRIMARY KEY` is the row key |
+| **Write-ahead log** | Changes go to a checksummed log and commit there first. After a crash, each statement is either wholly there or not at all. Checkpoints move the log into the main file |
 | **Free list** | Freed pages are linked through themselves and reused before the file grows |
 | **Tracer** | Every layer reports events (hit, miss, evict, read, write). They cost nothing when tracing is off and will drive the visualizer |
 | **Storage** | A file on disk or a buffer in memory, behind one trait, so the same engine can run in a browser |
-| **CLI** | `glassdb <file>` is a SQL prompt: multi-line statements, aligned result tables, `.tables` / `.schema`, history |
+| **CLI** | `glassdb <file>` is a SQL prompt: multi-line statements, aligned result tables, `.tables` / `.schema` / `.check` / `.checkpoint`, history |
 
 The exact byte layouts and the reasons behind each decision are in
 [docs/DESIGN.md](docs/DESIGN.md).
@@ -176,10 +184,11 @@ cargo test --workspace
 | Roundtrip tests | `crates/core/tests/pager_roundtrip.rs` | 1,000 pages written through a 16-frame cache, reopened, and every byte matches |
 | Property tests | `crates/core/tests/btree_props.rs` | Random inserts, deletes, lookups and range scans (including 100,000-op runs) always match Rust's `BTreeMap` |
 | SQL test files | `tests/sql/*.test` | Statements give exactly the expected output, before and after restarts (54 statements in `basics.test`) |
-| CLI tests | `crates/cli/tests/cli.rs` | The real binary creates files, echoes input and rejects non-database files |
+| CLI tests | `crates/cli/tests/cli.rs` | The real binary runs SQL, prints tables and rejects non-database files |
+| Power-cut tests | `crates/core/tests/crash_sim.rs` | A simulated disk loses or tears unsynced writes. The power is cut at every disk operation, and the database must recover exactly |
+| Kill tests | `crates/cli/tests/crash.rs` | The real binary gets `kill -9` at 200 random moments. Every confirmed statement survives, and no statement is half-applied |
 
-Planned: crash tests that kill the
-process mid-write, parser fuzzing, and benchmarks against SQLite.
+Planned: parser fuzzing and benchmarks against SQLite.
 
 ## Project layout
 
@@ -189,6 +198,7 @@ glassdb/
 │   ├── core/              engine library (glassdb-core)
 │   │   ├── src/
 │   │   │   ├── btree/     B+ tree nodes, splits, merges, cursors
+│   │   │   ├── wal/       write-ahead log: commits and recovery
 │   │   │   ├── sql/       tokenizer, parser, syntax tree
 │   │   │   ├── exec/      runs statements: select, insert, update, delete
 │   │   │   ├── catalog/   the list of tables (page 1)
@@ -212,7 +222,7 @@ glassdb/
 - [x] **Pager & file format:** 4 KB pages, header, LRU buffer cache, free list, tracer
 - [x] **B+ tree:** search, insert with splits, delete with merges, range cursors
 - [x] **SQL front end & catalog:** `CREATE`, `INSERT`, `SELECT … WHERE … ORDER BY … LIMIT`, `UPDATE`, `DELETE`
-- [ ] **Write-ahead log:** checksummed frames, recovery, checkpoints
+- [x] **Write-ahead log:** checksummed frames, recovery, checkpoints
 - [ ] **Transactions:** `BEGIN`, `COMMIT`, `ROLLBACK`
 - [ ] **Indexes & planner:** `CREATE INDEX`, index scans, `EXPLAIN`
 - [ ] **Time travel:** `AS OF`, `HISTORY`, `VACUUM HISTORY`

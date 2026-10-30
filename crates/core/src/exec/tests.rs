@@ -10,7 +10,13 @@ use crate::types::Value;
 
 fn open() -> (Database, Arc<RecordingTracer>) {
     let tracer = Arc::new(RecordingTracer::default());
-    let db = Database::open_with(Box::new(MemStorage::new()), 16, tracer.clone()).unwrap();
+    let db = Database::open_with(
+        Box::new(MemStorage::new()),
+        Box::new(MemStorage::new()),
+        16,
+        tracer.clone(),
+    )
+    .unwrap();
     tracer.take();
     (db, tracer)
 }
@@ -94,4 +100,73 @@ fn statements_report_start_and_finish_to_the_tracer() {
             },
         ]
     );
+}
+
+#[test]
+fn check_reports_the_shape_of_the_database() {
+    let (mut db, _) = open();
+    db.execute("CREATE TABLE a (n INT PRIMARY KEY, t TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (n INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (7)").unwrap();
+    let report = db.check().unwrap();
+    assert_eq!(report.tables, 2);
+    assert_eq!(report.rows, 3);
+    assert_eq!(report.pages, 4, "header, catalog and one page per table");
+    assert_eq!(report.free_pages, 0);
+    db.execute("DROP TABLE a").unwrap();
+    assert_eq!(db.check().unwrap().free_pages, 1);
+}
+
+#[test]
+fn the_log_file_lives_beside_the_database_until_a_clean_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("my.db");
+    let wal = dir.path().join("my.db-wal");
+
+    let mut db = Database::open(&path).unwrap();
+    db.execute("CREATE TABLE t (a INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert!(wal.exists());
+    drop(db); // a crash: no close
+
+    let mut db = Database::open(&path).unwrap();
+    assert_eq!(
+        db.recovered(),
+        3,
+        "catalog creation, CREATE TABLE and INSERT"
+    );
+    assert_eq!(db.execute("SELECT a FROM t").unwrap().to_string(), "a\n1");
+    db.close().unwrap();
+    assert!(!wal.exists(), "a clean close removes the log");
+
+    let mut db = Database::open(&path).unwrap();
+    assert_eq!(db.recovered(), 0);
+    assert_eq!(db.execute("SELECT a FROM t").unwrap().to_string(), "a\n1");
+}
+
+#[test]
+fn a_file_that_is_not_a_database_gets_no_log_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.txt");
+    std::fs::write(&path, vec![0xFF; 4096]).unwrap();
+    assert!(Database::open(&path).is_err());
+    assert!(!dir.path().join("notes.txt-wal").exists());
+}
+
+#[test]
+fn checkpoint_moves_the_log_into_the_main_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("my.db");
+    let mut db = Database::open(&path).unwrap();
+    db.execute("CREATE TABLE t (a INT)").unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        0,
+        "still only in the log"
+    );
+    db.checkpoint().unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 3 * 4096);
 }

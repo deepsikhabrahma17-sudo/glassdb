@@ -3,7 +3,8 @@
 //!
 //! Every statement checks everything it can before it writes anything, so a
 //! statement that fails (wrong type, duplicate key, ...) changes nothing.
-//! Each statement that changes data is flushed to disk when it finishes.
+//! Each statement that changes data commits to the write-ahead log when it
+//! finishes, so after a crash it is either wholly there or not at all.
 
 mod eval;
 mod select;
@@ -12,10 +13,13 @@ mod write;
 #[cfg(test)]
 mod tests;
 
+use std::ffi::OsString;
 use std::fmt;
-use std::path::Path;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::btree::BTree;
 use crate::catalog::{Catalog, TableSchema};
 use crate::error::{Error, Result};
 use crate::pager::{DEFAULT_CACHE_FRAMES, Pager};
@@ -77,32 +81,86 @@ impl fmt::Display for Output {
     }
 }
 
+/// What `Database::check` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckReport {
+    pub tables: usize,
+    pub rows: usize,
+    /// Pages in the database, including the header page.
+    pub pages: u32,
+    pub free_pages: u32,
+}
+
 pub struct Database {
     pager: Pager,
     catalog: Catalog,
+    /// The log file, removed after a clean close.
+    wal_path: Option<PathBuf>,
+}
+
+/// The log's path: `my.db` keeps its log in `my.db-wal`.
+fn wal_path(path: &Path) -> PathBuf {
+    let mut name = OsString::from(path);
+    name.push("-wal");
+    PathBuf::from(name)
+}
+
+/// Make new files in `path`'s folder durable. Without this a crash could lose
+/// the log file's name, and everything committed to it. Best effort, because
+/// not every system can sync a folder.
+fn sync_folder(path: &Path) {
+    let folder = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if let Ok(folder) = File::open(folder) {
+        let _ = folder.sync_all();
+    }
 }
 
 impl Database {
-    /// Open (or create) a database file.
+    /// Open (or create) a database file, with its log in `<path>-wal`.
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
+        let path = path.as_ref();
+        let log_path = wal_path(path);
         let storage = FileStorage::open(path)?;
-        Database::open_with(
+        let log = FileStorage::open(&log_path)?;
+        sync_folder(path);
+        match Database::open_with(
             Box::new(storage),
+            Box::new(log),
             DEFAULT_CACHE_FRAMES,
             Arc::new(NoopTracer),
-        )
+        ) {
+            Ok(mut db) => {
+                db.wal_path = Some(log_path);
+                Ok(db)
+            }
+            Err(err) => {
+                // Refused (not a database, say): leave no empty log behind.
+                if fs::metadata(&log_path).is_ok_and(|m| m.len() == 0) {
+                    let _ = fs::remove_file(&log_path);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Open a database on any storage, with a chosen cache size and tracer.
     pub fn open_with(
         storage: Box<dyn Storage>,
+        wal_storage: Box<dyn Storage>,
         cache_frames: usize,
         tracer: Arc<dyn Tracer>,
     ) -> Result<Database> {
-        let mut pager = Pager::open(storage, cache_frames, tracer)?;
+        let mut pager = Pager::open_with_wal(storage, wal_storage, cache_frames, tracer)?;
         let catalog = Catalog::open(&mut pager)?;
-        pager.flush()?; // a brand-new catalog goes to disk straight away
-        Ok(Database { pager, catalog })
+        pager.flush()?; // a brand-new catalog is committed straight away
+        Ok(Database {
+            pager,
+            catalog,
+            wal_path: None,
+        })
     }
 
     /// Parse and run exactly one statement.
@@ -140,9 +198,52 @@ impl Database {
         self.catalog.list(&mut self.pager)
     }
 
-    /// Flush everything and close the file.
+    /// How many committed transactions were recovered from the log on open.
+    /// More than zero means the last session ended without a clean close.
+    pub fn recovered(&self) -> usize {
+        self.pager.recovered()
+    }
+
+    /// Move the log's pages into the main file and empty the log.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        self.pager.checkpoint()
+    }
+
+    /// Verify the whole database: every B+ tree's invariants, every row's
+    /// encoding, the free list, and that every page is accounted for.
+    pub fn check(&mut self) -> Result<CheckReport> {
+        let mut used = 1 + self.catalog.check(&mut self.pager)?; // 1 for the header
+        let tables = self.tables()?;
+        let mut rows = 0;
+        for table in &tables {
+            let stats = BTree::open(table.root).check(&mut self.pager)?;
+            used += stats.internal_nodes + stats.leaves;
+            rows += select::scan(&mut self.pager, table)?.len();
+        }
+        self.pager.check_free_list()?;
+        let pages = self.pager.page_count();
+        let free_pages = self.pager.free_count();
+        if used + free_pages as usize != pages as usize {
+            return Err(Error::Corrupt(format!(
+                "{used} pages in use and {free_pages} free, but the file has {pages}"
+            )));
+        }
+        Ok(CheckReport {
+            tables: tables.len(),
+            rows,
+            pages,
+            free_pages,
+        })
+    }
+
+    /// Commit everything, checkpoint, and close. After this the log file is
+    /// gone and the database is entirely in its main file.
     pub fn close(self) -> Result<()> {
-        self.pager.close()
+        self.pager.close()?;
+        if let Some(path) = self.wal_path {
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
     }
 
     fn dispatch(&mut self, statement: &Statement) -> Result<Output> {
