@@ -15,10 +15,11 @@ const HELP: &str = "\
 Enter SQL statements ending with ';'. Statements can span several lines.
 BEGIN starts a transaction, shown by a * in the prompt. COMMIT keeps it and
 ROLLBACK undoes it. One still open when you leave is rolled back.
+EXPLAIN before a SELECT, UPDATE or DELETE shows how it would run.
 
 Commands:
   .tables          list the tables
-  .schema [name]   show CREATE TABLE statements
+  .schema [name]   show CREATE TABLE and CREATE INDEX statements
   .check           verify the whole database
   .checkpoint      move the log's pages into the main file
   .help            show this help
@@ -127,7 +128,8 @@ fn run_command(db: &mut Database, command: &str) {
         }),
         ".schema" => {
             let only = words.next().map(str::to_lowercase);
-            db.tables().map(|tables| {
+            db.tables().and_then(|tables| {
+                let indexes = db.indexes()?;
                 let shown: Vec<_> = tables
                     .iter()
                     .filter(|t| only.as_ref().is_none_or(|name| &t.name == name))
@@ -139,7 +141,11 @@ fn run_command(db: &mut Database, command: &str) {
                 }
                 for table in shown {
                     println!("{};", table.create_sql());
+                    for index in indexes.iter().filter(|i| i.table == table.name) {
+                        println!("{};", index.create_sql());
+                    }
                 }
+                Ok(())
             })
         }
         ".check" => db.check().map(|report| {

@@ -1,0 +1,230 @@
+# CREATE INDEX, DROP INDEX and EXPLAIN, before and after restarts.
+
+statement ok
+CREATE TABLE users (id INT PRIMARY KEY, age INT, name TEXT, score REAL)
+
+statement ok
+INSERT INTO users VALUES (1, 30, 'ada', 9.5), (2, 25, 'bob', 7.0), (3, 30, 'cy', NULL), (4, NULL, 'di', 8.0), (5, 41, 'ed', 6.5)
+
+# Without an index, only the primary key has a shortcut.
+
+query
+EXPLAIN SELECT * FROM users WHERE age = 30
+----
+plan
+FULL SCAN users
+FILTER age = 30
+
+query
+EXPLAIN SELECT * FROM users WHERE id = 2
+----
+plan
+PRIMARY KEY LOOKUP ON users (id = 2)
+FILTER id = 2
+
+query
+SELECT name FROM users WHERE id = 2
+----
+name
+bob
+
+query
+SELECT name FROM users WHERE id >= 2 AND id < 4
+----
+name
+bob
+cy
+
+statement ok
+CREATE INDEX by_age ON users (age)
+
+statement ok
+CREATE INDEX by_age_name ON users (age, name)
+
+statement ok
+CREATE INDEX by_score ON users (score)
+
+query
+EXPLAIN SELECT * FROM users WHERE age = 30
+----
+plan
+INDEX SCAN by_age ON users (age = 30)
+FILTER age = 30
+
+query
+EXPLAIN SELECT name FROM users WHERE age = 30 AND name > 'b' ORDER BY name LIMIT 1
+----
+plan
+INDEX SCAN by_age_name ON users (age = 30, name > 'b')
+FILTER age = 30 AND name > 'b'
+SORT name
+LIMIT 1
+
+query
+EXPLAIN DELETE FROM users WHERE score < 7
+----
+plan
+INDEX SCAN by_score ON users (score < 7.0)
+FILTER score < 7
+DELETE FROM users
+
+# The same answers as a scan, in the same order.
+
+query
+SELECT id FROM users WHERE age = 30
+----
+id
+1
+3
+
+query
+SELECT name FROM users WHERE age >= 30
+----
+name
+ada
+cy
+ed
+
+query
+SELECT name FROM users WHERE age < 30
+----
+name
+bob
+
+query
+SELECT name FROM users WHERE age = 30 AND name > 'b'
+----
+name
+cy
+
+query
+SELECT name FROM users WHERE score > 7
+----
+name
+ada
+di
+
+query
+SELECT name FROM users WHERE age = NULL
+----
+name
+
+query
+SELECT name FROM users WHERE age > 50 AND age < 10
+----
+name
+
+# Writes keep every index in step, and restarts keep the indexes.
+
+statement ok
+UPDATE users SET age = 26 WHERE age = 25
+
+statement ok
+DELETE FROM users WHERE name = 'cy'
+
+statement ok
+INSERT INTO users VALUES (6, 30, 'flo', 5.0)
+
+restart
+
+query
+SELECT name FROM users WHERE age = 30
+----
+name
+ada
+flo
+
+query
+SELECT name FROM users WHERE age = 26
+----
+name
+bob
+
+query
+EXPLAIN SELECT * FROM users WHERE score = 5
+----
+plan
+INDEX SCAN by_score ON users (score = 5.0)
+FILTER score = 5
+
+# Errors.
+
+statement error index by_age already exists
+CREATE INDEX by_age ON users (id)
+
+statement error table users already exists
+CREATE INDEX users ON users (id)
+
+statement error index by_age already exists
+CREATE TABLE by_age (a INT)
+
+statement error no such table: nope
+CREATE INDEX i ON nope (a)
+
+statement error no such column: nope
+CREATE INDEX i ON users (nope)
+
+statement error duplicate column age
+CREATE INDEX i ON users (age, age)
+
+statement error no such index: nope
+DROP INDEX nope
+
+statement error no such table: by_age
+DROP TABLE by_age
+
+statement error no such table: by_age
+SELECT * FROM by_age
+
+# IF NOT EXISTS and IF EXISTS skip quietly.
+
+statement ok
+CREATE INDEX IF NOT EXISTS by_age ON users (id)
+
+statement ok
+DROP INDEX IF EXISTS nope
+
+# Dropping an index only loses the shortcut.
+
+statement ok
+DROP INDEX by_age
+
+statement ok
+DROP INDEX by_age_name
+
+query
+EXPLAIN SELECT * FROM users WHERE age = 30
+----
+plan
+FULL SCAN users
+FILTER age = 30
+
+query
+SELECT name FROM users WHERE age = 30
+----
+name
+ada
+flo
+
+# A table's indexes go with it, so the names are free again.
+
+statement ok
+DROP TABLE users
+
+statement ok
+CREATE TABLE by_score (a INT)
+
+statement ok
+CREATE TABLE users (a INT)
+
+statement ok
+CREATE INDEX by_age ON users (a)
+
+restart
+
+query
+EXPLAIN SELECT * FROM users WHERE a = 1
+----
+plan
+INDEX SCAN by_age ON users (a = 1)
+FILTER a = 1

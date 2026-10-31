@@ -11,11 +11,15 @@
 //! checkpoints and empties its log. Within a process, `&mut self` already
 //! means one writer at a time.
 
-mod eval;
+mod access;
+pub(crate) mod eval;
+mod index;
 mod select;
 mod txn;
 mod write;
 
+#[cfg(test)]
+mod index_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -28,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::btree::BTree;
-use crate::catalog::{Catalog, TableSchema};
+use crate::catalog::{Catalog, IndexSchema, TableSchema};
 use crate::error::{Error, Result};
 use crate::pager::{DEFAULT_CACHE_FRAMES, Pager};
 use crate::sql::{CreateTable, Statement, parse_one};
@@ -40,12 +44,12 @@ use txn::Txn;
 /// What a statement produced.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Output {
-    /// From CREATE TABLE and DROP TABLE, such as "created table users".
+    /// From CREATE and DROP, and transaction statements: "created table users".
     Message(String),
     Inserted(usize),
     Updated(usize),
     Deleted(usize),
-    /// A SELECT's result: column names and rows of values.
+    /// A SELECT's result, or EXPLAIN's steps: column names and rows of values.
     Rows {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
@@ -211,6 +215,11 @@ impl Database {
         self.catalog.list(&mut self.pager)
     }
 
+    /// Every index, sorted by name.
+    pub fn indexes(&mut self) -> Result<Vec<IndexSchema>> {
+        self.catalog.indexes(&mut self.pager)
+    }
+
     /// How many committed transactions were recovered from the log on open.
     /// More than zero means the last session ended without a clean close.
     pub fn recovered(&self) -> usize {
@@ -227,15 +236,26 @@ impl Database {
     }
 
     /// Verify the whole database: every B+ tree's invariants, every row's
-    /// encoding, the free list, and that every page is accounted for.
+    /// encoding, that each index holds exactly its table's rows, the free
+    /// list, and that every page is accounted for.
     pub fn check(&mut self) -> Result<CheckReport> {
         let mut used = 1 + self.catalog.check(&mut self.pager)?; // 1 for the header
         let tables = self.tables()?;
         let mut rows = 0;
+        let mut indexes = 0;
         for table in &tables {
             let stats = BTree::open(table.root).check(&mut self.pager)?;
             used += stats.internal_nodes + stats.leaves;
             rows += select::scan(&mut self.pager, table)?.len();
+            let (pages, count) = index::check(self, table)?;
+            used += pages;
+            indexes += count;
+        }
+        if let Some(lost) = self.indexes()?.get(indexes) {
+            return Err(Error::Corrupt(format!(
+                "index {} and others belong to no table",
+                lost.name
+            )));
         }
         self.pager.check_free_list()?;
         let pages = self.pager.page_count();
@@ -288,6 +308,9 @@ impl Database {
                 filter,
             } => write::update(self, table, assignments, filter.as_ref()),
             Statement::Delete { table, filter } => write::delete(self, table, filter.as_ref()),
+            Statement::CreateIndex(def) => index::create(self, def),
+            Statement::DropIndex { name, if_exists } => index::drop(self, name, *if_exists),
+            Statement::Explain(inner) => access::explain(self, inner),
         }
     }
 

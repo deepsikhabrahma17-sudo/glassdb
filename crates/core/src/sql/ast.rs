@@ -34,6 +34,21 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    CreateIndex(CreateIndex),
+    DropIndex {
+        name: String,
+        if_exists: bool,
+    },
+    /// Show how a SELECT, UPDATE or DELETE would run, without running it.
+    Explain(Box<Statement>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndex {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub table: String,
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -363,6 +378,24 @@ impl fmt::Display for Statement {
             Statement::Begin => write!(f, "BEGIN"),
             Statement::Commit => write!(f, "COMMIT"),
             Statement::Rollback => write!(f, "ROLLBACK"),
+            Statement::CreateIndex(c) => {
+                let if_not_exists = if c.if_not_exists {
+                    "IF NOT EXISTS "
+                } else {
+                    ""
+                };
+                let columns = c.columns.join(", ");
+                write!(
+                    f,
+                    "CREATE INDEX {if_not_exists}{} ON {} ({columns})",
+                    c.name, c.table
+                )
+            }
+            Statement::DropIndex { name, if_exists } => {
+                let if_exists = if *if_exists { "IF EXISTS " } else { "" };
+                write!(f, "DROP INDEX {if_exists}{name}")
+            }
+            Statement::Explain(inner) => write!(f, "EXPLAIN {inner}"),
         }
     }
 }

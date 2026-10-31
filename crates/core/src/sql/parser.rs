@@ -12,14 +12,17 @@
 //! update := UPDATE name SET name = expr {, name = expr} [WHERE expr]
 //! delete := DELETE FROM name [WHERE expr]
 //! txn    := BEGIN [TRANSACTION] | COMMIT | ROLLBACK
+//! index  := CREATE INDEX [IF NOT EXISTS] name ON name ( name {, name} )
+//!         | DROP INDEX [IF EXISTS] name
+//! plan   := EXPLAIN (select | update | delete)
 //! ```
 //!
-//! `BEGIN`, `COMMIT`, `ROLLBACK` and `TRANSACTION` aren't keywords, only
-//! words with a meaning at the start of a statement, where no name can be.
-//! Reserving them would stop databases that use them as names from opening,
-//! because the catalog parses its stored `CREATE TABLE` text.
+//! `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION`, `INDEX`, `ON` and `EXPLAIN`
+//! aren't keywords, only words with a meaning where no name can be. Reserving
+//! them would stop databases that use them as names from opening, because the
+//! catalog parses its stored `CREATE TABLE` text.
 
-use super::ast::{ColumnDef, CreateTable, OrderBy, Select, SelectItem, Statement};
+use super::ast::{ColumnDef, CreateIndex, CreateTable, OrderBy, Select, SelectItem, Statement};
 use super::token::{Keyword, Spanned, Token, tokenize};
 use crate::error::{Error, Result};
 use crate::types::DataType;
@@ -133,8 +136,8 @@ impl Parser {
 
     fn statement(&mut self) -> Result<Statement> {
         match self.peek() {
-            Token::Keyword(Keyword::Create) => self.create_table(),
-            Token::Keyword(Keyword::Drop) => self.drop_table(),
+            Token::Keyword(Keyword::Create) => self.create(),
+            Token::Keyword(Keyword::Drop) => self.drop(),
             Token::Keyword(Keyword::Insert) => self.insert(),
             Token::Keyword(Keyword::Select) => self.select().map(Statement::Select),
             Token::Keyword(Keyword::Update) => self.update(),
@@ -152,28 +155,47 @@ impl Parser {
                 self.advance();
                 Ok(Statement::Rollback)
             }
+            Token::Ident(word) if word == "explain" => {
+                self.advance();
+                match self.peek() {
+                    Token::Keyword(Keyword::Select | Keyword::Update | Keyword::Delete) => {
+                        Ok(Statement::Explain(Box::new(self.statement()?)))
+                    }
+                    _ => self.expected("SELECT, UPDATE or DELETE after EXPLAIN"),
+                }
+            }
             _ => self.expected(
-                "a statement (CREATE, DROP, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT \
-                 or ROLLBACK)",
+                "a statement (CREATE, DROP, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT, \
+                 ROLLBACK or EXPLAIN)",
             ),
         }
     }
 
     /// Move past the current token if it is the unreserved word `word`.
-    fn eat_word(&mut self, word: &str) {
-        if matches!(self.peek(), Token::Ident(found) if found == word) {
+    fn eat_word(&mut self, word: &str) -> bool {
+        let found = matches!(self.peek(), Token::Ident(found) if found == word);
+        if found {
             self.advance();
         }
+        found
     }
 
-    fn create_table(&mut self) -> Result<Statement> {
-        self.expect_keyword(Keyword::Create)?;
-        self.expect_keyword(Keyword::Table)?;
-        let if_not_exists = self.eat_keyword(Keyword::If);
-        if if_not_exists {
+    fn if_not_exists(&mut self) -> Result<bool> {
+        let found = self.eat_keyword(Keyword::If);
+        if found {
             self.expect_keyword(Keyword::Not)?;
             self.expect_keyword(Keyword::Exists)?;
         }
+        Ok(found)
+    }
+
+    fn create(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Create)?;
+        if self.eat_word("index") {
+            return self.create_index();
+        }
+        self.expect_keyword(Keyword::Table)?;
+        let if_not_exists = self.if_not_exists()?;
         let name = self.name("a table name")?;
         self.expect(&Token::LParen, "'('")?;
         let columns = self.comma_list(Self::column_def)?;
@@ -181,6 +203,24 @@ impl Parser {
         Ok(Statement::CreateTable(CreateTable {
             name,
             if_not_exists,
+            columns,
+        }))
+    }
+
+    fn create_index(&mut self) -> Result<Statement> {
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.name("an index name")?;
+        if !self.eat_word("on") {
+            return self.expected("ON");
+        }
+        let table = self.name("a table name")?;
+        self.expect(&Token::LParen, "'('")?;
+        let columns = self.comma_list(|p| p.name("a column name"))?;
+        self.expect(&Token::RParen, "')' or ','")?;
+        Ok(Statement::CreateIndex(CreateIndex {
+            name,
+            if_not_exists,
+            table,
             columns,
         }))
     }
@@ -213,12 +253,19 @@ impl Parser {
         })
     }
 
-    fn drop_table(&mut self) -> Result<Statement> {
+    fn drop(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
-        self.expect_keyword(Keyword::Table)?;
+        let index = self.eat_word("index");
+        if !index {
+            self.expect_keyword(Keyword::Table)?;
+        }
         let if_exists = self.eat_keyword(Keyword::If);
         if if_exists {
             self.expect_keyword(Keyword::Exists)?;
+        }
+        if index {
+            let name = self.name("an index name")?;
+            return Ok(Statement::DropIndex { name, if_exists });
         }
         let name = self.name("a table name")?;
         Ok(Statement::DropTable { name, if_exists })

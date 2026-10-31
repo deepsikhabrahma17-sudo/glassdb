@@ -223,8 +223,10 @@ fn workload() -> Vec<Step> {
     let mut steps = vec![
         Step::Sql("CREATE TABLE a (id INT PRIMARY KEY, grp INT, n INT, note TEXT)".into()),
         Step::Sql("CREATE TABLE b (x INT PRIMARY KEY, y TEXT)".into()),
+        Step::Sql("CREATE INDEX a_by_grp ON a (grp, n)".into()),
+        Step::Sql("CREATE INDEX b_by_y ON b (y)".into()),
     ];
-    for g in 0..24 {
+    for g in 0..18 {
         let rows: Vec<String> = (0..4)
             .map(|_| format!("(NULL, {g}, 0, '{note}')"))
             .collect();
@@ -254,6 +256,11 @@ fn workload() -> Vec<Step> {
             steps.push(Step::Sql(
                 "CREATE TABLE b (x INT PRIMARY KEY, y TEXT)".into(),
             ));
+            steps.push(Step::Sql("CREATE INDEX b_by_y ON b (y)".into()));
+        }
+        if g % 11 == 6 {
+            steps.push(Step::Sql("DROP INDEX a_by_grp".into()));
+            steps.push(Step::Sql("CREATE INDEX a_by_grp ON a (grp, n)".into()));
         }
         if g % 7 == 2 {
             // Spill a long transaction, roll it back, then commit a shorter
@@ -277,6 +284,7 @@ fn workload() -> Vec<Step> {
             steps.push(Step::Sql("BEGIN".into()));
             steps.push(Step::Sql("CREATE TABLE ghost (y TEXT)".into()));
             steps.push(Step::Sql("INSERT INTO ghost VALUES ('ghost')".into()));
+            steps.push(Step::Sql("DROP INDEX a_by_grp".into()));
             steps.push(Step::Sql("DROP TABLE b".into()));
             steps.push(Step::Sql("ROLLBACK".into()));
         }

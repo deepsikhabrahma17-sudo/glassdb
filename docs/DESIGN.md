@@ -7,7 +7,7 @@ It grows with each build phase.
 
 | Crate | Package name | Kind | Purpose |
 | --- | --- | --- | --- |
-| `crates/core` | `glassdb-core` | library | The engine: pager, B+ tree, WAL, MVCC, SQL, planner, tracer |
+| `crates/core` | `glassdb-core` | library | The engine: pager, B+ tree, WAL, indexes, planner, SQL, tracer |
 | `crates/cli` | `glassdb` | binary | The `glassdb` SQL prompt (`cargo install glassdb`) |
 
 A browser crate (`crates/wasm`) and the visualizer (`web/`) are added when the
@@ -196,6 +196,9 @@ Transaction events:
 
 A statement outside a transaction sends no `TxnBegin` or `TxnCommit`. It sends
 `TxnRollback` only if it fails part-way.
+
+`Plan { steps }` reports what a `SELECT`, `UPDATE` or `DELETE` is about to run,
+with the same lines `EXPLAIN` prints.
 
 B+ tree events (the tree reaches the shared tracer through `pager.tracer()`):
 
@@ -466,8 +469,8 @@ demand with `.checkpoint`.
   can't show what a power cut does, because the operating system still finishes
   every write it was handed. This test's fake disk does. Anything written since
   the last sync may survive whole, survive torn, or be lost, chosen at random
-  for each write. A 102-step workload, transactions included, runs and the power
-  is cut at every one of its 483 disk operations, with 3 seeds. Sometimes the
+  for each write. An 86-step workload, transactions and indexes included, runs and
+  the power is cut at every one of its 689 disk operations, with 3 seeds. Sometimes the
   power fails again during recovery. After each cut the database must open, pass
   `check`, and hold exactly the state after the last confirmed step, or after the
   one in flight.
@@ -602,7 +605,7 @@ one writer. A second `Database` on the same file is refused like any other.
   whenever no transaction is open.
 - **Simulated power cuts, the done-when check:** the workload now rolls back
   transactions that spilled, commits shorter ones over the same stretch of the log,
-  and rolls back `CREATE TABLE` and `DROP TABLE`. After each of its 1,449 cuts the
+  and rolls back `CREATE TABLE` and `DROP TABLE`. After each of its 2,067 cuts the
   database must hold exactly the last committed state, or the one in flight. The
   rolled-back rows say `ghost`, and that word must never appear.
 - **Real kills:** each batch adds a transaction that rolls back and one that commits
@@ -617,6 +620,210 @@ one writer. A second `Database` on the same file is refused like any other.
   - The kill test caught three, and missed the bugs that need spilled pages. The
     real binary's 256-page cache is too big for its small batches to spill, so
     that case relies on the 4-frame power-cut and model tests.
+
+## Indexes and the planner
+
+```sql
+CREATE INDEX [IF NOT EXISTS] by_age ON users (age, name);
+DROP INDEX [IF EXISTS] by_age;
+EXPLAIN SELECT * FROM users WHERE age = 30 AND name > 'a';
+```
+
+**The rule: an index changes speed, never results.** Whichever way rows are found,
+the whole `WHERE` is still applied to every one of them. So a key range may hold
+rows that don't match, but must never miss one that does, and the planner can leave
+anything it isn't sure about to that filter. Rows found through an index are also
+read in table order, so a query gives the same rows in the same order with or
+without one. `tests/index_props.rs` tests exactly that.
+
+### Format
+
+An index is a B+ tree of its own with an entry for every row, NULLs included. The
+entry's value is empty and its key is the indexed columns then the row id:
+
+| Tag | Type | Bytes after the tag |
+| --- | --- | --- |
+| 1 | NULL | nothing |
+| 2 | BOOL | 1 byte, 0 or 1 |
+| 3 | INT | 8 bytes, the same as a table key |
+| 4 | REAL | 8 bytes: the IEEE bits with the sign bit set if positive, all flipped if negative |
+| 5 | TEXT | the bytes, with 0 written as `0 255`, then the end marker `0 1` |
+
+- **Byte order equals value order**, column by column, so the B+ tree needs no idea
+  what a key means. This is property-tested against `sort_cmp`.
+- **The row id** makes keys unique, so many rows can share a value, and says which
+  row an entry is for.
+- **The end marker** keeps `('a', 'z')` before `('ab', 'a')`. Without it the bytes
+  of the second column would run into the first. Escaping zeros keeps the marker
+  unambiguous and below every other byte.
+- `-0.0` is written as `0.0`, because they compare equal.
+- **A column has one type**, because `fit` converts values on the way in. So tags
+  only have to place NULL first; they never compare two types.
+
+Indexes share the catalog tree with tables, as a root page plus `CREATE INDEX` text,
+and the SQL says which kind an entry is. So they also share one set of names, as in
+SQLite. Nothing is kept in memory, so `ROLLBACK` undoes them with no extra code. The
+file format version didn't change: existing databases open as they are, but a build
+from before this phase can't read a database that has indexes.
+
+**Decision: a value too long to index is an error.** B+ tree keys stop at 512 bytes
+(`MAX_KEY`), but a row can reach 992. The alternative is storing a prefix, which is
+possible because `WHERE` is rechecked anyway, but ranges need much more care. The
+error comes during a statement's checking pass, so it changes nothing, and
+`CREATE INDEX` works out every key before it writes.
+
+### Keeping indexes in step
+
+`INSERT`, `UPDATE` and `DELETE` compute index keys in their checking pass and write
+them after the table. `UPDATE` skips an index whose key didn't change, which avoids
+needless writes, and removes every old entry before adding any new one, because one
+row's new entry can be another row's old one. `DROP TABLE` drops its indexes.
+`CREATE INDEX` sorts its keys first, so it fills the tree left to right and touches
+each leaf once.
+
+`Database::check` now also proves each index holds exactly its table's rows: it
+works out every key from the rows and compares the two lists. So the power-cut and
+kill tests verify indexes after every crash without knowing about them.
+
+### Choosing a plan
+
+`planner::choose` is a pure function of the schema and `WHERE`. It reads no pages.
+
+1. Split `WHERE` at each top-level `AND`. Anything under an `OR` or `NOT` is ignored.
+2. Keep conditions of the form `column op constant`, with `=`, `<`, `<=`, `>` or `>=`.
+   The constant may be on either side, and may be an expression like `20 + 10`.
+3. Combine them per column. `a > 1 AND a > 3 AND a < 9` becomes one range.
+4. Score each way of finding rows, and take the best:
+
+| Path | Example | Rank |
+| --- | --- | --- |
+| `PRIMARY KEY LOOKUP` | `id = 5` | 1 |
+| `INDEX SCAN` with `=` on leading columns | `age = 30` | 2 (more `=` columns win, then a range on top) |
+| `PRIMARY KEY RANGE` | `id > 5` | 3 |
+| `INDEX SCAN` with only a range | `age > 30` | 4 |
+| `FULL SCAN` | anything else | 5 |
+
+Ties go to the first index by name, so a plan never depends on creation order.
+
+An index on `(a, b, c)` uses `=` on its leading columns, then one range on the next
+column. `a = 1 AND b > 2` uses two columns. `a > 1 AND b = 2` and `a = 1 AND c = 3`
+each use one: nothing can follow a range or a gap.
+
+**What the planner refuses,** so the scan gives the right answer:
+
+- **NULL constants.** `a = NULL` matches nothing, and the filter says so.
+- **A constant that fails to evaluate,** such as `a = 1 / 0`. On an empty table a scan
+  never evaluates it, so failing during planning would be a new error.
+- **Mismatched types.** `a = 'x'` on an INT column is an error, and the scan reports it.
+- **An INT column against a REAL constant.** INT and REAL compare through `f64`, which
+  rounds large integers, so no key bound would be exact. A REAL column with an INT
+  constant is fine, because that's the same conversion the comparison makes.
+- **NaN.** See below.
+
+### Key ranges
+
+A key is the columns then a row id, so a bound can't name an exact key.
+`successor(bytes)` gives the point just past everything starting with those bytes:
+
+| Condition | Start | End |
+| --- | --- | --- |
+| `a = v` | `v` included | successor of `v`, excluded |
+| `a > v` | successor of `v`, included | past the prefix |
+| `a >= v` | `v` included | past the prefix |
+| `a < v` | first non-NULL value | `v` excluded |
+| `a <= v` | first non-NULL value | successor of `v`, excluded |
+
+The prefix is the encoded values of the `=` columns before this one.
+
+### Running a plan
+
+`exec/access.rs` turns a plan into rows. An index scan collects row ids from the
+range, sorts them, and fetches each row from the table. Sorting keeps results in
+table order, and also reads the table left to right. `SELECT`, `UPDATE` and `DELETE`
+all find their rows this way, and the `WHERE` filter comes after.
+
+If an index names a row that isn't there, the query fails with `Corrupt` rather than
+quietly returning fewer rows.
+
+### EXPLAIN
+
+`EXPLAIN` checks a statement exactly as running it would, then returns its steps as
+rows with one column, `plan`, without running it:
+
+```text
+INDEX SCAN by_age ON users (age > 30)
+FILTER age > 30
+SORT name
+LIMIT 10
+```
+
+It works on `SELECT`, `UPDATE` and `DELETE`. Keeping the steps as data means the
+tracer's `Plan` event and the visualizer can show the same thing.
+
+### NaN
+
+`0 / 0` is an error, but infinity minus infinity gives NaN, and `Value::compare`
+treats NaN as equal to everything. A full scan would match it on any `=`, and an
+index couldn't, so the two would disagree. Storing NaN in a column is now an error,
+and the planner ignores NaN constants. A database that already holds a NaN from an
+earlier build keeps working, but only its full scans treat it this way.
+
+### Limits
+
+- **No statistics,** so the planner goes by the query's shape. An index on a
+  low-variety column like a `BOOL` can be slower than a scan, since every match is
+  fetched by key.
+- **`ORDER BY` always sorts.** A query doesn't use an index to avoid that.
+- **Every matching row is read in full.** There are no covering indexes.
+- **`IS NULL` isn't looked up** in an index, though NULLs are stored in it.
+- **No `UNIQUE` indexes** yet.
+- **Errors can depend on the plan.** A condition that fails on some rows, such as
+  `b / 0 = 1`, only runs on rows that are found. So a query that fails in a full scan
+  can succeed with an index. SQL allows this, and it can only remove an error, never
+  change a result.
+
+### Testing
+
+- **Unit tests:** key order, each planner rule, and each executor path, in
+  `types/index_key_tests.rs`, `planner/tests.rs`, `exec/index_tests.rs` and
+  `sql/index_tests.rs`.
+- **SQL file:** `tests/sql/indexes.test`, with restarts.
+- **The comparison** (`crates/core/tests/index_props.rs`): random statements run on
+  two databases, one indexed and one not. Every statement must give identical
+  output, through transactions, crashes, and indexes being created and dropped, and
+  `check` must pass after each one.
+- **Pages read** (`crates/core/tests/index_speed.rs`): on 20,000 rows, a lookup
+  through an index reads at most 10 pages, against over 200 for a scan. Counting
+  pages can't fail because a machine is busy.
+- **Crash tests:** the power-cut and kill workloads now write through indexes, and
+  `check` verifies them after every crash.
+- **The done-when check** (`crates/core/examples/index_bench.rs`), on 1,000,000 rows
+  in a real file, in release mode on the development Mac:
+
+| Lookup | Time |
+| --- | --- |
+| Full scan (`n = ?`) | 119.68 ms |
+| Index (`n = ?`) | 20.84 µs |
+| Primary key (`id = ?`) | 13.71 µs |
+
+Inserting took 15.8 s and `CREATE INDEX` took 7.0 s. It's too slow for CI, so run it
+by hand with `cargo run --release -p glassdb-core --example index_bench`.
+
+- **Guarding the tests:** 21 bugs were planted one at a time, covering each write
+  skipping an index, wrong range bounds, a broken key encoding, misread conditions,
+  and rows returned in index order. Each made a test fail. The comparison test alone
+  caught 17, and the other four fell to the planner, unit and SQL tests:
+  - `DROP TABLE` leaving its indexes, which the comparison never runs
+  - an INT column taking a REAL constant, and text zeros left unescaped, which its
+    random statements didn't happen to expose
+  - `check` not comparing entries, which has no effect until an index is wrong
+
+  A `DELETE` that leaves its index entry was also run against the crash tests alone.
+  The power-cut test caught it at once. The kill test missed it, because nothing it
+  committed was ever deleted, so it now deletes rows from an indexed table too.
+
+  Moving a range bound outward isn't a bug under the rule above: `WHERE` filters the
+  extra rows out. Only a bound that misses rows was planted.
 
 ## SQL
 
@@ -633,6 +840,9 @@ DELETE FROM t [WHERE expr]
 BEGIN [TRANSACTION]
 COMMIT
 ROLLBACK
+CREATE INDEX [IF NOT EXISTS] i ON t (col, ...)
+DROP INDEX [IF EXISTS] i
+EXPLAIN SELECT ... | UPDATE ... | DELETE ...
 ```
 
 - **Types:** `INT` (also spelled `INTEGER`), `REAL`, `TEXT`, `BOOL` (also
@@ -640,8 +850,7 @@ ROLLBACK
 - **Names:** keywords and names are case-insensitive, and names are stored in
   lower case. Type names are ordinary words, not keywords, so a column may be
   called `text`.
-- **Not supported yet:** joins, aggregates (`COUNT`, …), `LIKE`, indexes,
-  qualified names (`t.col`), double-quoted names.
+- **Not supported yet:** joins, aggregates (`COUNT`, …), `LIKE`, qualified names (`t.col`), double-quoted names.
 
 ### Front end: tokens → syntax tree
 
@@ -736,8 +945,8 @@ order (property-tested for all `i64`). The **value** is the row:
   database is new (only the header exists, so the first allocated page is 1).
   Because a tree's root never moves, page 1 stays the catalog. The file header
   needed no change.
-- Each entry maps the table name to the table's root page (4 bytes,
-  little-endian) followed by its `CREATE TABLE` statement as tidy SQL.
+- Each entry maps a table or index name to its root page (4 bytes, little-endian)
+  followed by its `CREATE TABLE` or `CREATE INDEX` statement as tidy SQL.
 - On every lookup the SQL is parsed again to rebuild the schema, as SQLite
   does. The schema stays human-readable, and `.schema` prints it straight back.
 - Opening a file reads page 1 at once, so a file without a valid catalog fails
@@ -745,8 +954,8 @@ order (property-tested for all `i64`). The **value** is the row:
 - `CREATE TABLE` checks the definition before allocating anything: an
   existing table, duplicate columns, more than one primary key, or a non-INT
   primary key are all rejected.
-- `DROP TABLE` frees every page of the table with `BTree::destroy()`, then
-  removes the catalog entry.
+- `DROP TABLE` frees every page of the table and its indexes with
+  `BTree::destroy()`, then removes the catalog entries.
 
 ### Executor
 
@@ -760,18 +969,18 @@ db.close()?;
 ```
 
 `Output` is `Message` (CREATE/DROP and transaction statements), `Inserted(n)`,
-`Updated(n)`, `Deleted(n)`, or `Rows { columns, rows }`.
+`Updated(n)`, `Deleted(n)`, or `Rows { columns, rows }` (SELECT and EXPLAIN).
 
 - **SELECT:**
   1. Check every column name.
-  2. Scan the whole table in key order.
+  2. Find the rows the plan says to, in key order.
   3. Filter with WHERE.
   4. Compute the output columns.
   5. Sort (stable).
   6. Apply OFFSET, then LIMIT.
 
-  `SELECT` without `FROM` computes one row. Every scan reads the whole table
-  for now; using indexes to read less comes with the query planner.
+  `SELECT` without `FROM` computes one row. Step 2 is where
+  [the planner](#indexes-and-the-planner) comes in, and step 3 always runs.
 - **Decision: check everything, then write.**
   - INSERT evaluates and type-checks every row, assigns ids and checks keys
     before writing any of them.
@@ -812,7 +1021,8 @@ every statement kind, with two `restart`s, and repeats the same queries after
 each restart. The harness fails if it ever drops below 50 statements.
 `expressions.test` covers operators and NULL logic. `errors.test` checks
 error messages, and that failed statements write nothing. `transactions.test`
-covers `BEGIN`, `COMMIT` and `ROLLBACK` across restarts.
+covers `BEGIN`, `COMMIT` and `ROLLBACK` across restarts. `indexes.test` covers
+indexes and `EXPLAIN`.
 
 ## Continuous integration
 

@@ -53,7 +53,9 @@ impl Database {
                 }
                 result
             }
-            Txn::None if matches!(statement, Statement::Select(_)) => self.dispatch(statement),
+            Txn::None if matches!(statement, Statement::Select(_) | Statement::Explain(_)) => {
+                self.dispatch(statement)
+            }
             Txn::None => {
                 let result = self.dispatch(statement).and_then(|output| {
                     self.pager.flush()?;

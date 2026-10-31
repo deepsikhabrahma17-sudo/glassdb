@@ -26,8 +26,9 @@ together:
 > **Status:** early development. The storage engine (pager, buffer cache,
 > B+ tree) and a first SQL layer (tables, `SELECT`/`INSERT`/`UPDATE`/`DELETE`,
 > a catalog that survives restarts) work, a write-ahead log keeps them safe
-> through crashes, and `BEGIN`/`COMMIT`/`ROLLBACK` group changes into
-> transactions. Indexes and time travel are next. See the [roadmap](#roadmap).
+> through crashes, `BEGIN`/`COMMIT`/`ROLLBACK` group changes into transactions,
+> and indexes and a query planner make lookups fast. Time travel is next. See the
+> [roadmap](#roadmap).
 
 ## Contents
 
@@ -110,6 +111,13 @@ bigger than the cache into the log, rolls it back so the log shrinks again, cras
 halfway through another, and shows a second opener being refused.
 
 ```bash
+cargo run -p glassdb-core --example index_tour
+```
+
+The index tour builds indexes on 5,000 rows, shows what `EXPLAIN` picks for each
+kind of query, and counts the pages every plan reads.
+
+```bash
 cargo run -p glassdb-core --example btree_tour
 ```
 
@@ -137,10 +145,19 @@ level, scans a range along the leaf chain, borrows, merges and shrinks back:
 | **Catalog** | Table definitions live in their own B+ tree on page 1, so the schema survives restarts. `INT PRIMARY KEY` is the row key |
 | **Write-ahead log** | Changes go to a checksummed log and commit there first. After a crash, each transaction is either wholly there or not at all. Checkpoints move the log into the main file |
 | **Transactions** | `BEGIN`, `COMMIT` and `ROLLBACK`, including `CREATE TABLE` and `DROP TABLE`. A rolled-back transaction leaves no trace, even after a crash. A file lock means one program at a time has a database open |
+| **Indexes** | `CREATE INDEX` on one or more columns, kept in step on every write, and rolled back with everything else |
+| **Query planner** | Picks a primary key lookup, an index scan or a full scan for `SELECT`, `UPDATE` and `DELETE`. `EXPLAIN` shows the plan. An index changes speed, never results |
 | **Free list** | Freed pages are linked through themselves and reused before the file grows |
 | **Tracer** | Every layer reports events (hit, miss, evict, read, write). They cost nothing when tracing is off and will drive the visualizer |
 | **Storage** | A file on disk or a buffer in memory, behind one trait, so the same engine can run in a browser |
 | **CLI** | `glassdb <file>` is a SQL prompt: multi-line statements, aligned result tables, `.tables` / `.schema` / `.check` / `.checkpoint`, history |
+
+On a table of a million rows, a lookup takes about 120 ms with a full scan and
+about 21 µs through an index, in release mode on a Mac. Try it yourself:
+
+```bash
+cargo run --release -p glassdb-core --example index_bench
+```
 
 The exact byte layouts and the reasons behind each decision are in
 [docs/DESIGN.md](docs/DESIGN.md).
@@ -167,7 +184,7 @@ flowchart TD
     TRACE -.-> VIZ["Glass-box visualizer"]
 
     classDef done fill:#d1fae5,stroke:#059669,color:#064e3b
-    class SQL,BTREE,PAGER,DISK,UI,TRACE done
+    class SQL,PLAN,BTREE,PAGER,DISK,UI,TRACE done
 ```
 
 Green layers exist today. The rest are on the [roadmap](#roadmap).
@@ -194,6 +211,8 @@ cargo test --workspace
 | Roundtrip tests | `crates/core/tests/pager_roundtrip.rs` | 1,000 pages written through a 16-frame cache, reopened, and every byte matches |
 | Property tests | `crates/core/tests/btree_props.rs` | Random inserts, deletes, lookups and range scans (including 100,000-op runs) always match Rust's `BTreeMap` |
 | Transaction property tests | `crates/core/tests/txn_props.rs` | Random transactions, crashes and restarts on a tiny cache always match an in-memory model |
+| Index comparison | `crates/core/tests/index_props.rs` | Random statements on an indexed and an unindexed database always give identical output |
+| Page counts | `crates/core/tests/index_speed.rs` | An index lookup reads a handful of pages where a scan reads hundreds |
 | SQL test files | `tests/sql/*.test` | Statements give exactly the expected output, before and after restarts (54 statements in `basics.test`) |
 | CLI tests | `crates/cli/tests/cli.rs` | The real binary runs SQL, prints tables, and refuses non-database files and files already open |
 | Lock tests | `crates/core/tests/lock.rs` | A second open is refused and leaves the log alone, and a crash frees the lock |
@@ -212,9 +231,10 @@ glassdb/
 │   │   │   ├── btree/     B+ tree nodes, splits, merges, cursors
 │   │   │   ├── wal/       write-ahead log: commits and recovery
 │   │   │   ├── sql/       tokenizer, parser, syntax tree
+│   │   │   ├── planner/   picks how to find a statement's rows
 │   │   │   ├── exec/      runs statements and transactions
-│   │   │   ├── catalog/   the list of tables (page 1)
-│   │   │   ├── types/     values and row encoding
+│   │   │   ├── catalog/   the list of tables and indexes (page 1)
+│   │   │   ├── types/     values, row and index key encoding
 │   │   │   ├── pager/     pages, header, buffer cache
 │   │   │   ├── storage.rs file and in-memory storage
 │   │   │   ├── trace.rs   glass-box event stream
@@ -236,7 +256,7 @@ glassdb/
 - [x] **SQL front end & catalog:** `CREATE`, `INSERT`, `SELECT … WHERE … ORDER BY … LIMIT`, `UPDATE`, `DELETE`
 - [x] **Write-ahead log:** checksummed frames, recovery, checkpoints
 - [x] **Transactions:** `BEGIN`, `COMMIT`, `ROLLBACK`, one open at a time
-- [ ] **Indexes & planner:** `CREATE INDEX`, index scans, `EXPLAIN`
+- [x] **Indexes & planner:** `CREATE INDEX`, index scans, `EXPLAIN`
 - [ ] **Time travel:** `AS OF`, `HISTORY`, `VACUUM HISTORY`
 - [ ] **Glass-box visualizer:** WASM build, live tree / cache / WAL / plan panels
 - [ ] **Polish:** benchmarks vs SQLite, hosted browser demo, crates.io release

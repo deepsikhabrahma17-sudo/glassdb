@@ -71,6 +71,8 @@ pub enum Event {
     /// statement failed. `frames` of them had already spilled to the log.
     TxnRollback { frames: u32 },
 
+    /// The steps a statement will run, as `EXPLAIN` shows them.
+    Plan { steps: Vec<String> },
     /// A SQL statement started running (shown as tidy, canonical SQL).
     Statement { sql: String },
     /// The statement finished: a summary such as "inserted 2 rows" or "error: ...".

@@ -12,7 +12,7 @@ use crate::sql::{BinaryOp, Expr, UnaryOp};
 use crate::types::Value;
 
 /// What an expression can see: the table's columns and the current row.
-pub(super) struct Scope<'a> {
+pub(crate) struct Scope<'a> {
     pub schema: Option<&'a TableSchema>,
     pub row: &'a [Value],
 }
@@ -33,7 +33,7 @@ fn query<T>(msg: String) -> Result<T> {
 
 /// Check that every column `expr` names exists, before any row is read, so
 /// a typo fails even on an empty table.
-pub(super) fn check_columns(expr: &Expr, schema: Option<&TableSchema>) -> Result<()> {
+pub(crate) fn check_columns(expr: &Expr, schema: Option<&TableSchema>) -> Result<()> {
     match expr {
         Expr::Literal(_) => Ok(()),
         Expr::Column(name) => match schema.and_then(|s| s.column_index(name)) {
@@ -48,7 +48,7 @@ pub(super) fn check_columns(expr: &Expr, schema: Option<&TableSchema>) -> Result
     }
 }
 
-pub(super) fn eval(expr: &Expr, scope: &Scope) -> Result<Value> {
+pub(crate) fn eval(expr: &Expr, scope: &Scope) -> Result<Value> {
     match expr {
         Expr::Literal(value) => Ok(value.clone()),
         Expr::Column(name) => match scope.schema.and_then(|s| s.column_index(name)) {
@@ -90,7 +90,7 @@ pub(super) fn eval(expr: &Expr, scope: &Scope) -> Result<Value> {
 }
 
 /// Whether a WHERE result keeps the row: only TRUE does; FALSE and NULL don't.
-pub(super) fn is_true(value: &Value, clause: &str) -> Result<bool> {
+pub(crate) fn is_true(value: &Value, clause: &str) -> Result<bool> {
     match value {
         Value::Bool(b) => Ok(*b),
         Value::Null => Ok(false),

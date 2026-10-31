@@ -37,6 +37,25 @@ fn session(db: &Path, input: &str) -> (String, String) {
 }
 
 #[test]
+fn schema_shows_indexes_and_explain_prints_a_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = session(
+        &dir.path().join("test.db"),
+        "CREATE TABLE a (x INT);\n\
+         CREATE TABLE b (y INT);\n\
+         CREATE INDEX by_x ON a (x);\n\
+         CREATE INDEX by_y ON b (y);\n\
+         .schema a\n\
+         EXPLAIN SELECT * FROM a WHERE x = 1;\n",
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(stdout.contains("created index by_x"), "{stdout}");
+    assert!(stdout.contains("CREATE INDEX by_x ON a (x);"), "{stdout}");
+    assert!(!stdout.contains("CREATE INDEX by_y ON b (y);"), "{stdout}");
+    assert!(stdout.contains("INDEX SCAN by_x ON a (x = 1)"), "{stdout}");
+}
+
+#[test]
 fn a_second_glassdb_on_the_same_file_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");

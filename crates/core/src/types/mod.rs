@@ -1,7 +1,10 @@
 //! SQL values and column types.
 
 mod encode;
+mod index_key;
 
+#[cfg(test)]
+mod index_key_tests;
 #[cfg(test)]
 mod tests;
 
@@ -10,6 +13,7 @@ use std::fmt;
 
 use crate::error::{Error, Result};
 pub use encode::{decode_key, decode_row, encode_key, encode_row};
+pub use index_key::{FIRST_VALUE, encode_value, index_key, rowid_of, successor};
 
 /// The type of a table column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

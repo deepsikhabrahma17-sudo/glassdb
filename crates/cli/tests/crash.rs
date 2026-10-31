@@ -47,6 +47,14 @@ fn create_tables(path: &Path) {
         .unwrap();
     db.execute("CREATE TABLE counters (id INT PRIMARY KEY, n INT)")
         .unwrap();
+    // `check` proves after every kill that these still match their tables.
+    db.execute("CREATE INDEX ledger_by_batch ON ledger (batch)")
+        .unwrap();
+    db.execute("CREATE INDEX counters_by_n ON counters (n)")
+        .unwrap();
+    db.execute("CREATE TABLE scratch (n INT)").unwrap();
+    db.execute("CREATE INDEX scratch_by_n ON scratch (n)")
+        .unwrap();
     db.execute("CREATE TABLE left_side (batch INT)").unwrap();
     db.execute("CREATE TABLE right_side (batch INT)").unwrap();
     for _ in 0..COUNTERS {
@@ -73,6 +81,8 @@ fn batch_sql(batch: usize) -> String {
          BEGIN;\n\
          INSERT INTO left_side VALUES ({batch});\n\
          INSERT INTO right_side VALUES ({batch});\n\
+         INSERT INTO scratch VALUES ({batch});\n\
+         DELETE FROM scratch WHERE n < {batch};\n\
          COMMIT;\n",
         rows = rows.join(", ")
     )

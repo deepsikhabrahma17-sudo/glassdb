@@ -1,13 +1,14 @@
 //! INSERT, UPDATE and DELETE.
 //!
-//! Each works in two passes: first compute and check every row it will
-//! write (types, primary keys, sizes), then write. If the first pass finds a
-//! problem, nothing has been written yet.
+//! Each works in two passes: first compute and check every row and index key
+//! it will write (types, primary keys, sizes), then write. If the first pass
+//! finds a problem, nothing has been written yet.
 
 use std::collections::HashSet;
 
+use super::access::{check_filter, fetch, plan, trace_plan, write_steps};
 use super::eval::{Scope, check_columns, eval, is_true};
-use super::select::scan;
+use super::index::{self, Indexed};
 use super::{Database, Output};
 use crate::btree::{BTree, MAX_ENTRY};
 use crate::catalog::TableSchema;
@@ -47,6 +48,7 @@ pub(super) fn insert(
         }
     };
     let tree = BTree::open(schema.root);
+    let indexes = index::open_all(db, &schema)?;
     let pk = schema.primary_key();
 
     // Rows without a key get the next id after the largest one so far.
@@ -85,13 +87,47 @@ pub(super) fn insert(
         if !ids.insert(id) || tree.get(&mut db.pager, &key)?.is_some() {
             return Err(duplicate_key(&schema, id));
         }
-        prepared.push((key, row_bytes(&row)?));
+        let entries: Vec<Vec<u8>> = indexes
+            .iter()
+            .map(|index| index.key(&row, id))
+            .collect::<Result<_>>()?;
+        prepared.push((key, row_bytes(&row)?, entries));
     }
 
-    for (key, bytes) in &prepared {
+    for (key, bytes, entries) in &prepared {
         tree.insert(&mut db.pager, key, bytes)?;
+        for (index, entry) in indexes.iter().zip(entries) {
+            index.tree.insert(&mut db.pager, entry, &[])?;
+        }
     }
     Ok(Output::Inserted(prepared.len()))
+}
+
+/// Check an UPDATE's names. Returns the table and the column each SET fills.
+pub(super) fn check_update<'a>(
+    db: &mut Database,
+    table: &str,
+    assignments: &'a [(String, Expr)],
+    filter: Option<&Expr>,
+) -> Result<(TableSchema, Vec<(usize, &'a Expr)>)> {
+    let schema = db.table(table)?;
+    let mut targets = Vec::new();
+    for (name, expr) in assignments {
+        let Some(i) = schema.column_index(name) else {
+            return query(format!("no such column: {name}"));
+        };
+        check_columns(expr, Some(&schema))?;
+        targets.push((i, expr));
+    }
+    check_filter(filter, &schema)?;
+    Ok((schema, targets))
+}
+
+/// An index entry an UPDATE replaces.
+struct EntryChange {
+    index: usize,
+    old: Vec<u8>,
+    new: Vec<u8>,
 }
 
 pub(super) fn update(
@@ -100,25 +136,19 @@ pub(super) fn update(
     assignments: &[(String, Expr)],
     filter: Option<&Expr>,
 ) -> Result<Output> {
-    let schema = db.table(table)?;
+    let (schema, targets) = check_update(db, table, assignments, filter)?;
     let scope_schema = Some(&schema);
-    let mut targets = Vec::new();
-    for (name, expr) in assignments {
-        let Some(i) = schema.column_index(name) else {
-            return query(format!("no such column: {name}"));
-        };
-        check_columns(expr, scope_schema)?;
-        targets.push((i, expr));
-    }
-    if let Some(filter) = filter {
-        check_columns(filter, scope_schema)?;
-    }
     let tree = BTree::open(schema.root);
+    let indexes = index::open_all(db, &schema)?;
     let pk = schema.primary_key();
+    let access = plan(db, &schema, filter)?;
+    let action = format!("UPDATE {table}");
+    trace_plan(db, write_steps(table, &access, filter, action));
 
     // Pass 1: the new version of every matching row, as (old key, new key, bytes).
     let mut changes = Vec::new();
-    for (key, row) in scan(&mut db.pager, &schema)? {
+    let mut entry_changes = Vec::new();
+    for (key, row) in fetch(&mut db.pager, &schema, &access)? {
         let scope = Scope {
             schema: scope_schema,
             row: &row,
@@ -146,6 +176,13 @@ pub(super) fn update(
             },
         };
         let bytes = row_bytes(&new_row)?;
+        for (i, index) in indexes.iter().enumerate() {
+            let old = index.key(&row, decode_key(&key)?)?;
+            let new = index.key(&new_row, decode_key(&new_key)?)?;
+            if old != new {
+                entry_changes.push(EntryChange { index: i, old, new });
+            }
+        }
         changes.push((key, new_key, bytes));
     }
 
@@ -176,16 +213,39 @@ pub(super) fn update(
     for (_, new, bytes) in &changes {
         tree.insert(&mut db.pager, new, bytes)?;
     }
+    // Old entries go first too: one row's new entry may be another's old one.
+    for change in &entry_changes {
+        let index = &indexes[change.index];
+        index.tree.delete(&mut db.pager, &change.old)?;
+    }
+    for change in &entry_changes {
+        let index = &indexes[change.index];
+        index.tree.insert(&mut db.pager, &change.new, &[])?;
+    }
     Ok(Output::Updated(changes.len()))
 }
 
-pub(super) fn delete(db: &mut Database, table: &str, filter: Option<&Expr>) -> Result<Output> {
+/// Check a DELETE's names. Returns the table.
+pub(super) fn check_delete(
+    db: &mut Database,
+    table: &str,
+    filter: Option<&Expr>,
+) -> Result<TableSchema> {
     let schema = db.table(table)?;
-    if let Some(filter) = filter {
-        check_columns(filter, Some(&schema))?;
-    }
+    check_filter(filter, &schema)?;
+    Ok(schema)
+}
+
+pub(super) fn delete(db: &mut Database, table: &str, filter: Option<&Expr>) -> Result<Output> {
+    let schema = check_delete(db, table, filter)?;
+    let indexes: Vec<Indexed> = index::open_all(db, &schema)?;
+    let access = plan(db, &schema, filter)?;
+    let action = format!("DELETE FROM {table}");
+    trace_plan(db, write_steps(table, &access, filter, action));
+
     let mut doomed = Vec::new();
-    for (key, row) in scan(&mut db.pager, &schema)? {
+    let mut entries = Vec::new();
+    for (key, row) in fetch(&mut db.pager, &schema, &access)? {
         let scope = Scope {
             schema: Some(&schema),
             row: &row,
@@ -195,11 +255,17 @@ pub(super) fn delete(db: &mut Database, table: &str, filter: Option<&Expr>) -> R
         {
             continue;
         }
+        for (i, index) in indexes.iter().enumerate() {
+            entries.push((i, index.key(&row, decode_key(&key)?)?));
+        }
         doomed.push(key);
     }
     let tree = BTree::open(schema.root);
     for key in &doomed {
         tree.delete(&mut db.pager, key)?;
+    }
+    for (i, entry) in &entries {
+        indexes[*i].tree.delete(&mut db.pager, entry)?;
     }
     Ok(Output::Deleted(doomed.len()))
 }
@@ -209,6 +275,10 @@ fn fit(schema: &TableSchema, col: usize, value: Value) -> Result<Value> {
     let column = &schema.columns[col];
     let shown = format!("{} {}", value.type_name(), value.to_sql());
     match value.coerce(column.data_type) {
+        // NaN compares equal to everything, so an index couldn't place it.
+        Some(Value::Real(r)) if r.is_nan() => {
+            query(format!("column {} can't hold NaN", column.name))
+        }
         Some(v) => Ok(v),
         None => query(format!(
             "column {} is {}, got {shown}",
