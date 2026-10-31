@@ -31,6 +31,9 @@ pub enum Statement {
         table: String,
         filter: Option<Expr>,
     },
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -357,6 +360,9 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Statement::Begin => write!(f, "BEGIN"),
+            Statement::Commit => write!(f, "COMMIT"),
+            Statement::Rollback => write!(f, "ROLLBACK"),
         }
     }
 }

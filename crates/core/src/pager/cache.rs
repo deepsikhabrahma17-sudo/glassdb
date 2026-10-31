@@ -98,6 +98,12 @@ impl Cache {
         self.push_front(slot);
     }
 
+    /// Drop every frame, changed or not.
+    pub fn clear(&mut self) {
+        let capacity = self.slots.len();
+        *self = Cache::new(capacity);
+    }
+
     /// Ids of all dirty pages, in ascending order.
     pub fn dirty_pages(&self) -> Vec<PageId> {
         let mut pages: Vec<PageId> = self
@@ -210,6 +216,20 @@ mod tests {
         cache.insert(frame(5, false));
         cache.insert(frame(2, true));
         assert_eq!(cache.dirty_pages(), vec![2, 9]);
+    }
+
+    #[test]
+    fn clear_empties_every_frame() {
+        let mut cache = Cache::new(2);
+        cache.insert(frame(1, true));
+        cache.insert(frame(2, false));
+        cache.clear();
+        assert!(cache.lru_order().is_empty());
+        assert!(cache.dirty_pages().is_empty());
+        assert!(cache.evict_if_full().is_none(), "every frame is free again");
+        cache.insert(frame(3, false));
+        cache.insert(frame(4, false));
+        assert_eq!(cache.lru_order(), vec![4, 3]);
     }
 
     #[test]

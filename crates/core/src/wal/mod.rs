@@ -27,6 +27,8 @@
 //! record fails the check, and recovery stops at the first one that does.
 
 #[cfg(test)]
+mod rollback_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
@@ -65,6 +67,10 @@ pub struct Wal {
     end: u64,
     /// Checksum of the last record, which the next one chains from.
     crc: u32,
+    /// `end` and `crc` as of the last commit, which is where a rollback
+    /// returns to. Zero means there is no commit in the log.
+    commit_end: u64,
+    commit_crc: u32,
     /// Where each page's newest committed frame's bytes are.
     committed: HashMap<PageId, u64>,
     /// The same for the running transaction. Checked first by `read`.
@@ -102,6 +108,8 @@ impl Wal {
             size,
             end: 0,
             crc: 0,
+            commit_end: 0,
+            commit_crc: 0,
             committed: HashMap::new(),
             pending: HashMap::new(),
             frames: 0,
@@ -160,6 +168,8 @@ impl Wal {
                     wal.committed.extend(txn.drain(..));
                     wal.end = pos;
                     wal.crc = crc;
+                    wal.commit_end = pos;
+                    wal.commit_crc = crc;
                 }
                 _ => break,
             }
@@ -202,6 +212,27 @@ impl Wal {
         self.storage.sync()?;
         self.committed.extend(self.pending.drain());
         self.txn_frames = 0;
+        self.commit_end = self.end;
+        self.commit_crc = self.crc;
+        Ok(frames)
+    }
+
+    /// End the running transaction without keeping it: cut the log back to
+    /// the last commit. Returns how many frames were thrown away.
+    ///
+    /// There is no need to sync. If a crash brings the cut frames back, they
+    /// still have no commit record, so recovery throws them away anyway.
+    pub fn rollback(&mut self) -> Result<u32> {
+        let frames = self.txn_frames;
+        self.pending.clear();
+        self.frames -= frames;
+        self.txn_frames = 0;
+        self.end = self.commit_end;
+        self.crc = self.commit_crc;
+        if self.size > self.end {
+            self.storage.truncate(self.end)?;
+            self.size = self.end;
+        }
         Ok(frames)
     }
 
@@ -238,6 +269,8 @@ impl Wal {
         self.size = 0;
         self.end = 0;
         self.crc = 0;
+        self.commit_end = 0;
+        self.commit_crc = 0;
         self.committed.clear();
         self.pending.clear();
         self.frames = 0;

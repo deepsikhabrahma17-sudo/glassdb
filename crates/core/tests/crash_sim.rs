@@ -8,7 +8,8 @@
 //! A fixed workload runs and the power is cut at every single write, truncate
 //! and sync in turn. After each cut the database must reopen, pass `check`,
 //! and hold exactly the state after the last confirmed statement, or after
-//! the one in flight. It must never hold a partly applied statement.
+//! the one in flight. It must never hold a partly applied statement, or
+//! anything from a transaction that rolled back or never committed.
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -254,6 +255,31 @@ fn workload() -> Vec<Step> {
                 "CREATE TABLE b (x INT PRIMARY KEY, y TEXT)".into(),
             ));
         }
+        if g % 7 == 2 {
+            // Spill a long transaction, roll it back, then commit a shorter
+            // one over the same stretch of the log.
+            let rows: Vec<String> = (0..120).map(|_| "(NULL, 'ghost')".to_string()).collect();
+            steps.push(Step::Sql("BEGIN".into()));
+            steps.push(Step::Sql(format!(
+                "INSERT INTO b VALUES {}",
+                rows.join(", ")
+            )));
+            steps.push(Step::Sql("UPDATE a SET note = 'ghost'".into()));
+            steps.push(Step::Sql("ROLLBACK".into()));
+            steps.push(Step::Sql("BEGIN".into()));
+            steps.push(Step::Sql(format!(
+                "INSERT INTO a VALUES (NULL, {g}, 1, 'x')"
+            )));
+            steps.push(Step::Sql("UPDATE a SET n = n + 1".into()));
+            steps.push(Step::Sql("COMMIT".into()));
+        }
+        if g % 8 == 5 {
+            steps.push(Step::Sql("BEGIN".into()));
+            steps.push(Step::Sql("CREATE TABLE ghost (y TEXT)".into()));
+            steps.push(Step::Sql("INSERT INTO ghost VALUES ('ghost')".into()));
+            steps.push(Step::Sql("DROP TABLE b".into()));
+            steps.push(Step::Sql("ROLLBACK".into()));
+        }
     }
     steps
 }
@@ -296,13 +322,19 @@ fn reopen_and_check(images: [Vec<u8>; 2]) -> String {
 fn power_cuts_at_every_disk_operation() {
     let steps = workload();
 
-    // A run with no power cut gives the state after each step.
+    // A run with no power cut gives the state a crash after each step must
+    // leave. Inside a transaction, that is still the last committed state.
     let disk = Disk::new([Vec::new(), Vec::new()], u64::MAX, 1);
     let mut db = disk.open().unwrap();
     let mut states = vec![contents(&mut db)];
     for step in &steps {
         run(&mut db, step).unwrap();
-        states.push(contents(&mut db));
+        let state = if db.in_transaction() {
+            states.last().unwrap().clone()
+        } else {
+            contents(&mut db)
+        };
+        states.push(state);
     }
     db.close().unwrap();
     let total_ops = disk.ops_done();
@@ -330,6 +362,10 @@ fn power_cuts_at_every_disk_operation() {
             };
 
             let found = reopen_and_check(images);
+            assert!(
+                !found.contains("ghost"),
+                "seed {seed}, cut at operation {cut}: a rolled-back change came back"
+            );
             if found == states[confirmed] {
                 outcomes[0] += 1;
             } else if states.get(confirmed + 1) == Some(&found) {

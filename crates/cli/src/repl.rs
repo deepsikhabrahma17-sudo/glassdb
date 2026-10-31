@@ -25,11 +25,12 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub fn prompt(&self) -> &'static str {
-        if self.buffer.is_empty() {
-            "glassdb> "
-        } else {
-            "   ...> "
+    /// The prompt, with a `*` while a transaction is waiting to end.
+    pub fn prompt(&self, in_transaction: bool) -> &'static str {
+        match (self.buffer.is_empty(), in_transaction) {
+            (true, false) => "glassdb> ",
+            (true, true) => "glassdb*> ",
+            (false, _) => "   ...> ",
         }
     }
 
@@ -148,11 +149,19 @@ mod tests {
     #[test]
     fn prompt_shows_an_unfinished_statement() {
         let mut repl = Repl::default();
-        assert_eq!(repl.prompt(), "glassdb> ");
+        assert_eq!(repl.prompt(false), "glassdb> ");
         repl.feed("SELECT");
-        assert_eq!(repl.prompt(), "   ...> ");
+        assert_eq!(repl.prompt(false), "   ...> ");
         assert_eq!(repl.finish(), Some("SELECT".into()));
-        assert_eq!(repl.prompt(), "glassdb> ");
+        assert_eq!(repl.prompt(false), "glassdb> ");
         assert_eq!(repl.finish(), None);
+    }
+
+    #[test]
+    fn prompt_shows_an_open_transaction() {
+        let mut repl = Repl::default();
+        assert_eq!(repl.prompt(true), "glassdb*> ");
+        repl.feed("SELECT");
+        assert_eq!(repl.prompt(true), "   ...> ");
     }
 }

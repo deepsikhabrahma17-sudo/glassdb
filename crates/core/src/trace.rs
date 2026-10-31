@@ -63,6 +63,14 @@ pub enum Event {
         discarded: usize,
     },
 
+    /// `BEGIN`: changes now wait for `COMMIT` instead of committing one by one.
+    TxnBegin,
+    /// `COMMIT` finished: the transaction is safe in the log.
+    TxnCommit,
+    /// Uncommitted changes were thrown away, by `ROLLBACK` or because a
+    /// statement failed. `frames` of them had already spilled to the log.
+    TxnRollback { frames: u32 },
+
     /// A SQL statement started running (shown as tidy, canonical SQL).
     Statement { sql: String },
     /// The statement finished: a summary such as "inserted 2 rows" or "error: ...".

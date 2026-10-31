@@ -37,6 +37,65 @@ fn session(db: &Path, input: &str) -> (String, String) {
 }
 
 #[test]
+fn a_second_glassdb_on_the_same_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let _first = glassdb_core::Database::open(&path).unwrap();
+
+    let out = run(&[path.to_str().unwrap()], "");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("locked"), "{stderr}");
+}
+
+#[test]
+fn a_transaction_left_open_is_rolled_back_with_a_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let (stdout, stderr) = session(
+        &path,
+        "CREATE TABLE t (id INT PRIMARY KEY);\n\
+         BEGIN;\n\
+         INSERT INTO t VALUES (1);\n",
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(stdout.contains("transaction started"), "{stdout}");
+    assert!(stdout.contains("open transaction rolled back"), "{stdout}");
+
+    let (stdout, _) = session(&path, "SELECT * FROM t;\n");
+    assert!(stdout.contains("(0 rows)"), "{stdout}");
+}
+
+#[test]
+fn a_finished_transaction_gets_no_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = session(
+        &dir.path().join("test.db"),
+        "CREATE TABLE t (id INT PRIMARY KEY);\n\
+         BEGIN;\n\
+         INSERT INTO t VALUES (1);\n\
+         COMMIT;\n\
+         BEGIN;\n\
+         ROLLBACK;\n\
+         .checkpoint\n",
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(stdout.contains("committed"), "{stdout}");
+    assert!(stdout.contains("rolled back"), "{stdout}");
+    assert!(!stdout.contains("open transaction"), "{stdout}");
+}
+
+#[test]
+fn checkpoint_is_refused_inside_a_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, stderr) = session(
+        &dir.path().join("test.db"),
+        "BEGIN;\n.checkpoint\nROLLBACK;\n",
+    );
+    assert!(stderr.contains("inside a transaction"), "{stderr}");
+}
+
+#[test]
 fn runs_sql_and_prints_a_table() {
     let dir = tempfile::tempdir().unwrap();
     let (stdout, stderr) = session(

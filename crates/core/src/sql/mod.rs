@@ -7,6 +7,8 @@ pub mod token;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod txn_tests;
 
 pub use ast::{
     BinaryOp, ColumnDef, CreateTable, Expr, OrderBy, Select, SelectItem, Statement, UnaryOp,

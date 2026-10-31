@@ -28,7 +28,7 @@ glassdb <database-file>
 - It opens the file and its log, or creates a new database (header page and
   empty catalog). Then it prints a banner with the version, the file name and the
   table count. A file that isn't a GlassDB database is reported and left
-  untouched (exit code 1).
+  untouched (exit code 1). So is a file that something else has open.
 - **Input** collects lines until the text ends with a `;` that isn't inside a
   `'string'` or a `-- comment`. A statement can span lines (the prompt shows
   `   ...>`), and one line can hold several statements. A syntax error in one
@@ -41,6 +41,8 @@ glassdb <database-file>
 - **Dot commands** (only at the start of a statement): `.tables`,
   `.schema [table]`, `.check`, `.checkpoint`, `.help`, `.exit` / `.quit`.
 - **After a crash**, the banner says how many transactions were recovered from the log.
+- **Transactions:** the prompt is `glassdb*>` while one is open. Leaving with one
+  open rolls it back and prints `open transaction rolled back`.
 - **Keys:** Ctrl-C drops a half-typed statement. Ctrl-D (end of input) runs
   anything left unfinished, then exits with code 0. So `glassdb my.db < script.sql` works.
 - **Code layout:** `repl.rs` (statement buffering) and `render.rs` (tables)
@@ -53,7 +55,8 @@ glassdb <database-file>
 The pager and the log read and write through a `Storage` trait (`read_at`,
 `write_at`, `truncate`, `size`, `sync`), not through `File` directly.
 
-- `FileStorage` is a real file, used by the CLI.
+- `FileStorage` is a real file, used by the CLI. It can also take the file's
+  exclusive lock (see [The lock](#the-lock)).
 - `MemStorage` is a `Vec<u8>` behind `Arc<Mutex<…>>`. Clones share the same bytes, so a
   test can close a pager and reopen "the same disk". The browser build will use it too.
 
@@ -182,6 +185,17 @@ Log events:
 
 With a log, an evicted dirty page sends `WalAppend` instead of `PageWrite`, and a
 page found in the log sends `WalRead` instead of `PageRead`.
+
+Transaction events:
+
+| Event | When |
+| --- | --- |
+| `TxnBegin` | `BEGIN` ran |
+| `TxnCommit` | `COMMIT` finished, after its `WalCommit` |
+| `TxnRollback { frames }` | Uncommitted changes were thrown away; `frames` had already spilled to the log |
+
+A statement outside a transaction sends no `TxnBegin` or `TxnCommit`. It sends
+`TxnRollback` only if it fails part-way.
 
 B+ tree events (the tree reaches the shared tracer through `pager.tracer()`):
 
@@ -336,10 +350,10 @@ the tree cannot change during a scan.
 
 ## Write-ahead log
 
-**The rule:** a transaction counts only once its commit record is on disk. Each
-statement is one transaction for now. Anything after the last valid commit
-record is thrown away on recovery, so after a crash a statement is either wholly
-there or not there at all.
+**The rule:** a transaction counts only once its commit record is on disk. A
+statement outside `BEGIN`/`COMMIT` is a transaction of its own. Anything after
+the last valid commit record is thrown away on recovery, so after a crash a
+transaction is either wholly there or not there at all.
 
 `my.db` keeps its log in `my.db-wal`, beside it. The log file exists while the
 database is open, and after a crash. A clean close removes it.
@@ -434,11 +448,14 @@ demand with `.checkpoint`.
 
 ### Limits
 
-- **Two programs on one file** aren't protected against each other yet.
-- **Disk errors while running:** if a write fails with an I/O error, the session
-  should be closed and reopened.
-- **Speed:** every statement waits for a `sync`, so writes are limited by the
-  disk. Grouping statements into one commit needs `BEGIN`/`COMMIT`.
+- **A failed `sync`:** if the sync of a commit fails, there's no telling whether
+  the commit record reached the disk. The statement reports an error and is
+  rolled back, but a crash straight after could still bring it back.
+- **A failed automatic checkpoint** doesn't fail the commit that triggered it,
+  because that commit is already safe. The log stays whole, and the next commit
+  tries again.
+- **Speed:** every commit waits for a `sync`, so writes are limited by the disk.
+  A transaction turns many statements into one commit.
 
 ### Crash testing
 
@@ -449,15 +466,17 @@ demand with `.checkpoint`.
   can't show what a power cut does, because the operating system still finishes
   every write it was handed. This test's fake disk does. Anything written since
   the last sync may survive whole, survive torn, or be lost, chosen at random
-  for each write. A 55-step workload runs and the power is cut at every one of
-  its 417 disk operations, with 3 seeds. Sometimes the power fails again during
-  recovery. After each cut the database must open, pass `check`, and hold exactly
-  the state after the last confirmed step, or after the one in flight.
+  for each write. A 102-step workload, transactions included, runs and the power
+  is cut at every one of its 483 disk operations, with 3 seeds. Sometimes the
+  power fails again during recovery. After each cut the database must open, pass
+  `check`, and hold exactly the state after the last confirmed step, or after the
+  one in flight.
 - **Real kills, the done-when check** (`crates/cli/tests/crash.rs`): the real
   `glassdb` binary runs a stream of statements with `.checkpoint` mixed in and
   gets SIGKILL at a random moment, 200 times, on one growing database. After every
   kill: `check` must pass, every confirmed statement must be there, every INSERT
   batch must be whole, and an UPDATE of all rows must have reached all of them.
+  [Transactions](#transactions) adds its own checks to both tests.
 - **Guarding the tests:** each of these bugs was planted once and made a test fail:
   - commit doesn't sync the log
   - recovery ignores checksums
@@ -472,6 +491,133 @@ The power-cut test found a real bug while it was being built. The log header can
 tear between the magic and the version, and recovery read that as "unsupported
 version 0" and refused to open the database.
 
+## Transactions
+
+```sql
+BEGIN [TRANSACTION];
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;
+UPDATE accounts SET balance = balance + 10 WHERE id = 2;
+COMMIT;      -- or ROLLBACK
+```
+
+Outside a transaction, each statement commits when it finishes. Inside one,
+nothing commits until `COMMIT`, and a transaction sees its own changes. Nothing
+changed on disk to support this: the file formats are the same as before.
+
+### Commit and rollback
+
+`COMMIT` is the commit a single statement already did: `Pager::flush` appends the
+changed pages and a commit record, then syncs. A transaction's changes live in the
+same three places as a statement's: the cache, uncommitted frames in the log, and
+the in-memory copy of the header.
+
+`ROLLBACK` undoes all three:
+
+1. **The cache is emptied, all of it.** Dropping only dirty frames would be a bug.
+   A page that spilled to the log and was read back is clean in the cache, yet
+   still holds uncommitted bytes.
+2. **The header goes back to the last committed copy**, which undoes page
+   allocations and frees. `Pager` keeps that copy, updated on every commit.
+3. **The log is cut back to the last commit.** `Wal` keeps the end position and
+   checksum as of that commit, so the next record chains from there.
+
+**Decision: a rollback writes nothing and needs no sync.** It leaves no record in
+the log. If a crash undoes the cut and brings frames back, they still have no
+commit record, so recovery throws them away. This is what makes "no trace, even
+after a crash" true, and it comes from Phase 4's rule rather than from new code.
+
+The main file is never involved, because it only changes during a checkpoint.
+
+**The catalog needs no special care.** It's a B+ tree with no state in memory, so
+`CREATE TABLE` and `DROP TABLE` roll back like any other page change. A table's
+pages return to wherever they were, and `check` still accounts for every page.
+
+### When a statement fails
+
+**Decision: an error found before writing leaves the transaction open.** Statements
+check everything before they write, so a duplicate key or a wrong type has changed
+nothing. The transaction carries on, as in SQLite. PostgreSQL aborts the whole
+transaction instead, which would throw away work for no reason here.
+
+Any other error (a failed disk write, corruption) may strike with a statement half
+done. So:
+
+- **Inside a transaction,** it moves to a failed state. Every statement, `COMMIT`
+  included, is refused until `ROLLBACK`. Rolling back at once would be worse,
+  because the statements typed after it would each commit on their own, and the
+  closing `COMMIT` would then be the first sign of trouble.
+- **Outside a transaction,** the statement is rolled back straight away.
+  Otherwise the next statement's commit would sweep up its half-written pages.
+
+### Rules
+
+- `BEGIN` inside a transaction, and `COMMIT` or `ROLLBACK` outside one, are errors.
+- `.checkpoint` inside a transaction is refused, because a checkpoint empties the
+  log and would lose its frames. Automatic checkpoints only run just after a
+  commit, when no transaction is running.
+- `Database::close` rolls back an open transaction. Quitting isn't a promise to commit.
+- A transaction can be bigger than the cache and spills to the log. The log has no
+  size limit while one runs, since `CHECKPOINT_FRAMES` is only checked at a commit.
+  Rolled-back frames don't count towards it.
+- `BEGIN`, `COMMIT`, `ROLLBACK` and `TRANSACTION` are not reserved words. They mean
+  something only at the start of a statement, where a name can't appear. The
+  catalog parses its stored `CREATE TABLE` text on open, so reserving them would
+  stop any database with a table or column of those names from opening.
+
+### The lock
+
+**Decision: one open at a time.** `Database::open` takes an exclusive lock on the
+database file, or fails at once with `Error::Locked`. It's held until the
+`Database` is closed or dropped. Readers are refused too.
+
+This is stricter than the "one writer at a time" a database needs in the end, and
+it's needed anyway. Opening a database checkpoints and empties its log, so a second
+open would destroy a running writer's log. Sharing a file between programs safely
+would take a shared index of the log, like SQLite's `-shm` file, and readers that
+stay stable while a writer runs. Phase 7's row versions are the place to revisit that.
+
+Within one process, `Database::run` takes `&mut self`, so Rust already allows only
+one writer. A second `Database` on the same file is refused like any other.
+
+- **How:** `File::try_lock` from the standard library, which is `flock` on Linux and
+  macOS. No lock file is left on disk, and the operating system releases the lock
+  when the process dies, so a crash can't leave a stale lock. A lock file would.
+- **Order on open:** the lock comes before the log is touched, so a refused open
+  changes nothing.
+- **Order on close:** the log is removed before the lock is released. The other
+  way round, a new opener could create its log just in time for this one to delete it.
+- **Only real files are locked.** `MemStorage` has nothing to share.
+
+### Testing
+
+- **Unit tests:** `wal/rollback_tests.rs`, `pager/rollback_tests.rs`,
+  `exec/txn_tests.rs` and `sql/txn_tests.rs`. A storage wrapper makes the log fail
+  on demand, which reaches the failed state.
+- **SQL file:** `tests/sql/transactions.test`, with restarts.
+- **Lock:** `crates/core/tests/lock.rs`, plus a real second `glassdb` process in
+  `crates/cli/tests/cli.rs`.
+- **Property test** (`crates/core/tests/txn_props.rs`): random statements,
+  transactions, table changes, crashes and restarts on a 4-frame cache, against an
+  in-memory model. The two must agree after every step, and `check` must pass
+  whenever no transaction is open.
+- **Simulated power cuts, the done-when check:** the workload now rolls back
+  transactions that spilled, commits shorter ones over the same stretch of the log,
+  and rolls back `CREATE TABLE` and `DROP TABLE`. After each of its 1,449 cuts the
+  database must hold exactly the last committed state, or the one in flight. The
+  rolled-back rows say `ghost`, and that word must never appear.
+- **Real kills:** each batch adds a transaction that rolls back and one that commits
+  to two tables. After every kill no rolled-back row may be there, the two tables
+  must match, and the file must open at once, which shows the lock was released.
+- **Guarding the tests:** 21 bugs were planted one at a time in the rollback,
+  commit, close and lock code, and each made a test fail. Eight of the worst were
+  then run against the crash tests alone:
+  - The power-cut test caught seven. It missed `close` committing an open
+    transaction, because its workload never closes with one open.
+  - The model test caught all eight.
+  - The kill test caught three, and missed the bugs that need spilled pages. The
+    real binary's 256-page cache is too big for its small batches to spill, so
+    that case relies on the 4-frame power-cut and model tests.
+
 ## SQL
 
 ### Statements
@@ -484,6 +630,9 @@ SELECT * | expr [[AS] alias], ... [FROM t] [WHERE expr]
        [ORDER BY expr [ASC|DESC], ...] [LIMIT n [OFFSET m]]
 UPDATE t SET col = expr, ... [WHERE expr]
 DELETE FROM t [WHERE expr]
+BEGIN [TRANSACTION]
+COMMIT
+ROLLBACK
 ```
 
 - **Types:** `INT` (also spelled `INTEGER`), `REAL`, `TEXT`, `BOOL` (also
@@ -610,8 +759,8 @@ for statement in sql::parse(script)? { db.run(&statement)?; }
 db.close()?;
 ```
 
-`Output` is `Message` (CREATE/DROP), `Inserted(n)`, `Updated(n)`, `Deleted(n)`,
-or `Rows { columns, rows }`.
+`Output` is `Message` (CREATE/DROP and transaction statements), `Inserted(n)`,
+`Updated(n)`, `Deleted(n)`, or `Rows { columns, rows }`.
 
 - **SELECT:**
   1. Check every column name.
@@ -631,9 +780,10 @@ or `Rows { columns, rows }`.
     row that stays. Moved rows are deleted, then every new version is written.
   - SET expressions all see the old row, so `SET a = b, b = a` swaps.
 
-  As a result a statement that fails with an error changes nothing.
+  As a result a statement rejected with an error changes nothing.
 - Every statement that changes data commits to the write-ahead log when it
-  finishes. A crash at any moment keeps it whole or loses it whole.
+  finishes, or at `COMMIT` inside a transaction. A crash at any moment keeps it
+  whole or loses it whole.
 - The tracer gets `Statement { sql }` when a statement starts and
   `StatementDone { summary }` when it finishes.
 
@@ -661,7 +811,8 @@ restart                   # close and reopen from the file on disk
 every statement kind, with two `restart`s, and repeats the same queries after
 each restart. The harness fails if it ever drops below 50 statements.
 `expressions.test` covers operators and NULL logic. `errors.test` checks
-error messages, and that failed statements write nothing.
+error messages, and that failed statements write nothing. `transactions.test`
+covers `BEGIN`, `COMMIT` and `ROLLBACK` across restarts.
 
 ## Continuous integration
 

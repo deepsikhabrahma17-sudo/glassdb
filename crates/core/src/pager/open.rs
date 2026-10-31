@@ -113,6 +113,7 @@ impl Pager {
             storage,
             header,
             header_dirty,
+            committed_header: header,
             cache: Cache::new(cache_frames),
             tracer,
             wal,

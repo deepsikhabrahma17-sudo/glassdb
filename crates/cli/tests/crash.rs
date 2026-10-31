@@ -1,8 +1,11 @@
-//! The Phase 4 done-when check: the real `glassdb` binary is killed with
-//! SIGKILL at random moments, 200 times, on one growing database.
+//! The Phase 4 and 5 done-when checks: the real `glassdb` binary is killed
+//! with SIGKILL at random moments, 200 times, on one growing database.
 //!
 //! After every kill the database must open and pass `check`, hold every
-//! statement `glassdb` confirmed, and hold no half-applied statement.
+//! statement `glassdb` confirmed, and hold no half-applied statement. Nothing
+//! from a rolled-back transaction may appear, and a committed transaction's
+//! statements must all be there or all be gone. The file lock must also be
+//! free again, or the open right after the kill would be refused.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -19,6 +22,8 @@ const KILLS: usize = 200;
 /// Every INSERT adds this many rows, so a torn one shows as a smaller group.
 const BATCH: usize = 5;
 const COUNTERS: usize = 5;
+/// The batch number of rows that are always rolled back.
+const GHOST: i64 = -1;
 
 /// xorshift64: where each kill lands. The seed is printed so a failure can
 /// be repeated.
@@ -42,21 +47,34 @@ fn create_tables(path: &Path) {
         .unwrap();
     db.execute("CREATE TABLE counters (id INT PRIMARY KEY, n INT)")
         .unwrap();
+    db.execute("CREATE TABLE left_side (batch INT)").unwrap();
+    db.execute("CREATE TABLE right_side (batch INT)").unwrap();
     for _ in 0..COUNTERS {
         db.execute("INSERT INTO counters (n) VALUES (0)").unwrap();
     }
     db.close().unwrap();
 }
 
-/// The statements of one batch: an INSERT and an UPDATE of every counter.
+/// The statements of one batch: an INSERT and an UPDATE of every counter,
+/// then a transaction that rolls back and one that commits.
 fn batch_sql(batch: usize) -> String {
     let pad = "p".repeat(200);
     let rows: Vec<String> = (0..BATCH)
         .map(|_| format!("(NULL, {batch}, '{pad}')"))
         .collect();
     format!(
-        "INSERT INTO ledger VALUES {};\nUPDATE counters SET n = n + 1;\n",
-        rows.join(", ")
+        "INSERT INTO ledger VALUES {rows};\n\
+         UPDATE counters SET n = n + 1;\n\
+         BEGIN;\n\
+         INSERT INTO ledger VALUES (NULL, {GHOST}, 'ghost');\n\
+         UPDATE counters SET n = n + 1000000;\n\
+         DELETE FROM ledger WHERE batch < {batch};\n\
+         ROLLBACK;\n\
+         BEGIN;\n\
+         INSERT INTO left_side VALUES ({batch});\n\
+         INSERT INTO right_side VALUES ({batch});\n\
+         COMMIT;\n",
+        rows = rows.join(", ")
     )
 }
 
@@ -91,8 +109,16 @@ fn run_and_kill(path: &Path, first_batch: usize, delay: Duration) -> (usize, usi
     let reader = {
         let (inserts, updates) = (inserts.clone(), updates.clone());
         thread::spawn(move || {
+            // Only statements outside a transaction count as confirmed here.
+            let mut in_transaction = false;
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if line.starts_with("inserted ") {
+                if line.starts_with("transaction started") {
+                    in_transaction = true;
+                } else if line.starts_with("rolled back") || line.starts_with("committed") {
+                    in_transaction = false;
+                } else if in_transaction {
+                    continue;
+                } else if line.starts_with("inserted ") {
                     inserts.fetch_add(1, Ordering::SeqCst);
                 } else if line.starts_with("updated ") {
                     updates.fetch_add(1, Ordering::SeqCst);
@@ -142,12 +168,21 @@ fn survives_200_random_kills() {
         db.check()
             .unwrap_or_else(|e| panic!("{at}: check failed: {e}"));
 
-        // Every batch must be whole.
+        // A committed transaction wrote both sides, or neither.
+        let sides = |db: &mut Database, table: &str| rows(db, &format!("SELECT * FROM {table}"));
+        assert_eq!(
+            sides(&mut db, "left_side"),
+            sides(&mut db, "right_side"),
+            "{at}: a committed transaction is half there"
+        );
+
+        // Every batch must be whole, and nothing rolled back may appear.
         let mut groups: BTreeMap<i64, usize> = BTreeMap::new();
         for row in rows(&mut db, "SELECT batch FROM ledger") {
             let Value::Int(batch) = row[0] else {
                 panic!("{at}: bad batch value")
             };
+            assert_ne!(batch, GHOST, "{at}: a rolled-back row came back");
             *groups.entry(batch).or_default() += 1;
         }
         for (batch, count) in &groups {

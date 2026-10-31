@@ -32,6 +32,8 @@ pub enum Error {
     },
     /// SQL that parses but can't run: unknown table, wrong type, and so on.
     Query(String),
+    /// Something else has this database file open.
+    Locked,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -57,6 +59,7 @@ impl fmt::Display for Error {
                 column,
             } => write!(f, "syntax error at {line}:{column}: {message}"),
             Error::Query(msg) => write!(f, "{msg}"),
+            Error::Locked => write!(f, "database is locked: something else has it open"),
         }
     }
 }

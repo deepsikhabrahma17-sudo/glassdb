@@ -13,6 +13,8 @@ use rustyline::error::ReadlineError;
 
 const HELP: &str = "\
 Enter SQL statements ending with ';'. Statements can span several lines.
+BEGIN starts a transaction, shown by a * in the prompt. COMMIT keeps it and
+ROLLBACK undoes it. One still open when you leave is rolled back.
 
 Commands:
   .tables          list the tables
@@ -58,7 +60,7 @@ fn main() -> ExitCode {
     let mut repl = Repl::default();
 
     loop {
-        match editor.readline(repl.prompt()) {
+        match editor.readline(repl.prompt(db.in_transaction())) {
             Ok(line) => {
                 // History is a convenience; failing to record it is harmless.
                 let _ = editor.add_history_entry(line.as_str());
@@ -85,6 +87,9 @@ fn main() -> ExitCode {
         }
     }
 
+    if db.in_transaction() {
+        println!("open transaction rolled back");
+    }
     if let Err(err) = db.close() {
         eprintln!("error: cannot save {path}: {err}");
         return ExitCode::FAILURE;

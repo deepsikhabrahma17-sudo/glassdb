@@ -4,14 +4,22 @@
 //! Every statement checks everything it can before it writes anything, so a
 //! statement that fails (wrong type, duplicate key, ...) changes nothing.
 //! Each statement that changes data commits to the write-ahead log when it
-//! finishes, so after a crash it is either wholly there or not at all.
+//! finishes, or at `COMMIT` inside a transaction (see `txn`), so after a crash
+//! it is either wholly there or not at all.
+//!
+//! A database file is locked for as long as it is open, because opening one
+//! checkpoints and empties its log. Within a process, `&mut self` already
+//! means one writer at a time.
 
 mod eval;
 mod select;
+mod txn;
 mod write;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod txn_tests;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -27,6 +35,7 @@ use crate::sql::{CreateTable, Statement, parse_one};
 use crate::storage::{FileStorage, Storage};
 use crate::trace::{Event, NoopTracer, Tracer};
 use crate::types::Value;
+use txn::Txn;
 
 /// What a statement produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +105,7 @@ pub struct Database {
     catalog: Catalog,
     /// The log file, removed after a clean close.
     wal_path: Option<PathBuf>,
+    txn: Txn,
 }
 
 /// The log's path: `my.db` keeps its log in `my.db-wal`.
@@ -119,11 +129,14 @@ fn sync_folder(path: &Path) {
 }
 
 impl Database {
-    /// Open (or create) a database file, with its log in `<path>-wal`.
+    /// Open (or create) a database file, with its log in `<path>-wal`. Fails
+    /// with `Error::Locked` if something else has the file open.
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
         let path = path.as_ref();
         let log_path = wal_path(path);
         let storage = FileStorage::open(path)?;
+        // Before touching the log, which may be in use by whoever holds this.
+        storage.lock()?;
         let log = FileStorage::open(&log_path)?;
         sync_folder(path);
         match Database::open_with(
@@ -160,6 +173,7 @@ impl Database {
             pager,
             catalog,
             wal_path: None,
+            txn: Txn::None,
         })
     }
 
@@ -178,13 +192,12 @@ impl Database {
                 sql: statement.to_string(),
             },
         );
-        let mut result = self.dispatch(statement);
-        if result.is_ok()
-            && !matches!(statement, Statement::Select(_))
-            && let Err(err) = self.pager.flush()
-        {
-            result = Err(err);
-        }
+        let result = match statement {
+            Statement::Begin => self.begin(),
+            Statement::Commit => self.commit(),
+            Statement::Rollback => self.rollback(),
+            _ => self.run_data_statement(statement),
+        };
         let summary = match &result {
             Ok(output) => output.summary(),
             Err(err) => format!("error: {err}"),
@@ -204,8 +217,12 @@ impl Database {
         self.pager.recovered()
     }
 
-    /// Move the log's pages into the main file and empty the log.
+    /// Move the log's pages into the main file and empty the log. Not during
+    /// a transaction, whose frames are in the log and not yet committed.
     pub fn checkpoint(&mut self) -> Result<()> {
+        if self.in_transaction() {
+            return Err(Error::Query("can't checkpoint inside a transaction".into()));
+        }
         self.pager.checkpoint()
     }
 
@@ -236,18 +253,27 @@ impl Database {
         })
     }
 
-    /// Commit everything, checkpoint, and close. After this the log file is
-    /// gone and the database is entirely in its main file.
-    pub fn close(self) -> Result<()> {
-        self.pager.close()?;
-        if let Some(path) = self.wal_path {
+    /// Roll back any open transaction, checkpoint, and close. After this the
+    /// log file is gone and the database is entirely in its main file.
+    pub fn close(mut self) -> Result<()> {
+        if self.in_transaction() {
+            self.pager.rollback()?;
+        }
+        self.pager.checkpoint()?;
+        // The log goes first: the file lock is released when `self` is
+        // dropped, and the next opener must not have its new log deleted.
+        if let Some(path) = &self.wal_path {
             let _ = fs::remove_file(path);
         }
         Ok(())
     }
 
+    /// Run a statement's own work, with no commit or transaction handling.
     fn dispatch(&mut self, statement: &Statement) -> Result<Output> {
         match statement {
+            Statement::Begin | Statement::Commit | Statement::Rollback => {
+                unreachable!("`run` handles transaction statements")
+            }
             Statement::CreateTable(def) => self.create_table(def),
             Statement::DropTable { name, if_exists } => self.drop_table(name, *if_exists),
             Statement::Insert {

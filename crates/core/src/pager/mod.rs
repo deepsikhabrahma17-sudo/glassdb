@@ -8,13 +8,16 @@
 //! With a write-ahead log (`open_with_wal`), the main file changes only during
 //! a checkpoint. A read looks in the cache, then the log, then the main file.
 //! A changed page that must leave the cache goes to the log, and `flush`
-//! commits. Without a log (`open`), pages go straight to the main file, which
-//! is simpler and faster but not crash safe; the lower-level tests use it.
+//! commits, or `rollback` throws the changes away. Without a log (`open`),
+//! pages go straight to the main file, which is simpler and faster but not
+//! crash safe and can't roll back; the lower-level tests use it.
 
 pub mod cache;
 pub mod header;
 mod open;
 
+#[cfg(test)]
+mod rollback_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -46,6 +49,8 @@ pub struct Pager {
     /// In-memory copy of page 0; written back by `flush` when `header_dirty`.
     header: Header,
     header_dirty: bool,
+    /// The header as of the last commit, which a rollback restores.
+    committed_header: Header,
     cache: Cache,
     tracer: Arc<dyn Tracer>,
     wal: Option<Wal>,
@@ -171,13 +176,33 @@ impl Pager {
             self.tracer.event(&Event::WalAppend { page: 0 });
         }
         let frames = wal.commit()?;
+        self.committed_header = self.header;
         if frames > 0 {
             self.tracer.event(&Event::WalCommit { frames });
         }
         if wal.frames() >= CHECKPOINT_FRAMES {
-            copy_log_to_main(wal, self.storage.as_mut(), self.tracer.as_ref())?;
+            // The commit is already safe, so a failure here mustn't report it
+            // as failed. The log stays whole and the next commit tries again.
+            let _ = copy_log_to_main(wal, self.storage.as_mut(), self.tracer.as_ref());
         }
         Ok(())
+    }
+
+    /// Throw away every change since the last commit. Returns how many frames
+    /// had already spilled to the log. Needs a log: without one, spilled pages
+    /// have overwritten the main file and can't be taken back.
+    pub fn rollback(&mut self) -> Result<u32> {
+        let Some(wal) = &mut self.wal else {
+            return Err(Error::Query("rollback needs a write-ahead log".into()));
+        };
+        // Every frame goes, not just the dirty ones: a page that spilled and
+        // was read back is clean in the cache but still uncommitted.
+        self.cache.clear();
+        self.header = self.committed_header;
+        self.header_dirty = false;
+        let frames = wal.rollback()?;
+        self.tracer.event(&Event::TxnRollback { frames });
+        Ok(frames)
     }
 
     /// Commit, then move the log's pages into the main file and empty the log.

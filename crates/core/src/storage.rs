@@ -3,12 +3,12 @@
 //! The pager only ever asks for "these bytes at this offset", so the same
 //! engine runs on a file (CLI), in memory (tests) and in the browser (WASM).
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 pub trait Storage: Send {
     /// Fill `buf` with the bytes starting at `offset`.
@@ -47,6 +47,17 @@ impl FileStorage {
             .truncate(false)
             .open(path)?;
         Ok(FileStorage { file })
+    }
+
+    /// Take the file's exclusive lock, or fail with `Error::Locked` at once.
+    /// The operating system releases it when this storage is dropped or the
+    /// process dies, so a crash can't leave a stale lock behind.
+    pub fn lock(&self) -> Result<()> {
+        match self.file.try_lock() {
+            Ok(()) => Ok(()),
+            Err(TryLockError::WouldBlock) => Err(Error::Locked),
+            Err(TryLockError::Error(err)) => Err(err.into()),
+        }
     }
 }
 
@@ -175,6 +186,19 @@ mod tests {
         disk.clone().write_at(0, b"xyz").unwrap();
         assert_eq!(disk.to_bytes(), b"xyz");
         assert_eq!(MemStorage::from_bytes(vec![1, 2]).to_bytes(), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_locked_file_refuses_a_second_lock_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage.db");
+        let first = FileStorage::open(&path).unwrap();
+        first.lock().unwrap();
+
+        let second = FileStorage::open(&path).unwrap();
+        assert!(matches!(second.lock(), Err(Error::Locked)));
+        drop(first);
+        second.lock().unwrap();
     }
 
     #[test]

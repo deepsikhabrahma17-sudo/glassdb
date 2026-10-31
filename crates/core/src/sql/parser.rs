@@ -11,7 +11,13 @@
 //!           [ORDER BY expr [ASC|DESC] {, ...}] [LIMIT expr [OFFSET expr]]
 //! update := UPDATE name SET name = expr {, name = expr} [WHERE expr]
 //! delete := DELETE FROM name [WHERE expr]
+//! txn    := BEGIN [TRANSACTION] | COMMIT | ROLLBACK
 //! ```
+//!
+//! `BEGIN`, `COMMIT`, `ROLLBACK` and `TRANSACTION` aren't keywords, only
+//! words with a meaning at the start of a statement, where no name can be.
+//! Reserving them would stop databases that use them as names from opening,
+//! because the catalog parses its stored `CREATE TABLE` text.
 
 use super::ast::{ColumnDef, CreateTable, OrderBy, Select, SelectItem, Statement};
 use super::token::{Keyword, Spanned, Token, tokenize};
@@ -133,7 +139,30 @@ impl Parser {
             Token::Keyword(Keyword::Select) => self.select().map(Statement::Select),
             Token::Keyword(Keyword::Update) => self.update(),
             Token::Keyword(Keyword::Delete) => self.delete(),
-            _ => self.expected("a statement (CREATE, DROP, INSERT, SELECT, UPDATE or DELETE)"),
+            Token::Ident(word) if word == "begin" => {
+                self.advance();
+                self.eat_word("transaction");
+                Ok(Statement::Begin)
+            }
+            Token::Ident(word) if word == "commit" => {
+                self.advance();
+                Ok(Statement::Commit)
+            }
+            Token::Ident(word) if word == "rollback" => {
+                self.advance();
+                Ok(Statement::Rollback)
+            }
+            _ => self.expected(
+                "a statement (CREATE, DROP, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT \
+                 or ROLLBACK)",
+            ),
+        }
+    }
+
+    /// Move past the current token if it is the unreserved word `word`.
+    fn eat_word(&mut self, word: &str) {
+        if matches!(self.peek(), Token::Ident(found) if found == word) {
+            self.advance();
         }
     }
 
