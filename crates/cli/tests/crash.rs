@@ -5,7 +5,8 @@
 //! statement `glassdb` confirmed, and hold no half-applied statement. Nothing
 //! from a rolled-back transaction may appear, and a committed transaction's
 //! statements must all be there or all be gone. The file lock must also be
-//! free again, or the open right after the kill would be refused.
+//! free again, or the open right after the kill would be refused. Moments
+//! recorded after earlier kills must still read back exactly with `AS OF`.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -24,6 +25,13 @@ const BATCH: usize = 5;
 const COUNTERS: usize = 5;
 /// The batch number of rows that are always rolled back.
 const GHOST: i64 = -1;
+
+/// A moment seen after a kill, to be read again after later ones.
+struct Moment {
+    txn: u64,
+    counters: Vec<Vec<Value>>,
+    scratch: Vec<Vec<Value>>,
+}
 
 /// xorshift64: where each kill lands. The seed is printed so a failure can
 /// be repeated.
@@ -168,6 +176,7 @@ fn survives_200_random_kills() {
     let mut next_batch = 0; // the first batch number not yet known to be in
     let mut counter_value = 0; // what every counter held after the last round
     let mut recovered = 0;
+    let mut moments: Vec<Moment> = Vec::new();
     for round in 0..KILLS {
         let delay = Duration::from_micros(random(&mut rng) % 30_000);
         let (inserts, updates) = run_and_kill(&path, next_batch, delay);
@@ -235,6 +244,35 @@ fn survives_200_random_kills() {
             value == counter_value + updates || value == counter_value + updates + 1,
             "{at}: counters at {value}, was {counter_value}, {updates} confirmed"
         );
+
+        // The past must not have moved, whatever the kill landed on.
+        for _ in 0..3 {
+            if moments.is_empty() {
+                break;
+            }
+            let moment = &moments[random(&mut rng) as usize % moments.len()];
+            let txn = moment.txn;
+            assert_eq!(
+                rows(&mut db, &format!("SELECT * FROM counters AS OF TXN {txn}")),
+                moment.counters,
+                "{at}: counters at txn {txn} changed"
+            );
+            assert_eq!(
+                rows(&mut db, &format!("SELECT * FROM scratch AS OF TXN {txn}")),
+                moment.scratch,
+                "{at}: scratch at txn {txn} changed"
+            );
+        }
+        let txn = db.latest_txn().unwrap();
+        assert!(
+            moments.last().is_none_or(|last| last.txn <= txn),
+            "{at}: transaction ids went backwards"
+        );
+        moments.push(Moment {
+            txn,
+            counters: rows(&mut db, "SELECT * FROM counters"),
+            scratch: rows(&mut db, "SELECT * FROM scratch"),
+        });
 
         next_batch = present;
         counter_value = value;

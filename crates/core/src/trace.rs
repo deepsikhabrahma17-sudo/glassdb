@@ -71,6 +71,29 @@ pub enum Event {
     /// statement failed. `frames` of them had already spilled to the log.
     TxnRollback { frames: u32 },
 
+    /// A transaction took its id and commit time in the commit log.
+    Committed { txn: u64, time: i64 },
+    /// A row's old version moved to its table's history tree.
+    VersionKept {
+        rowid: i64,
+        created: u64,
+        deleted: u64,
+    },
+    /// A read of the past (`AS OF` or a reader) looked at `visible + hidden`
+    /// versions, and `visible` of them existed at transaction `txn`.
+    PastRead {
+        txn: u64,
+        visible: usize,
+        hidden: usize,
+    },
+    /// `VACUUM HISTORY` removed `versions` old versions and `tables` dropped
+    /// tables, so `AS OF` can now reach back only to transaction `txn`.
+    Vacuumed {
+        txn: u64,
+        versions: usize,
+        tables: usize,
+    },
+
     /// The steps a statement will run, as `EXPLAIN` shows them.
     Plan { steps: Vec<String> },
     /// A SQL statement started running (shown as tidy, canonical SQL).

@@ -25,8 +25,8 @@ glassdb <database-file>
 ```
 
 - With no file argument, it prints usage to stderr and exits with code 2.
-- It opens the file and its log, or creates a new database (header page and
-  empty catalog). Then it prints a banner with the version, the file name and the
+- It opens the file and its log, or creates a new database (header page, empty
+  catalog and empty commit log). Then it prints a banner with the version, the file name and the
   table count. A file that isn't a GlassDB database is reported and left
   untouched (exit code 1). So is a file that something else has open.
 - **Input** collects lines until the text ends with a `;` that isn't inside a
@@ -39,10 +39,15 @@ glassdb <database-file>
   - Other statements print a line, such as `inserted 2 rows`.
   - Errors go to stderr as `error: …`, and the session carries on.
 - **Dot commands** (only at the start of a statement): `.tables`,
-  `.schema [table]`, `.check`, `.checkpoint`, `.help`, `.exit` / `.quit`.
+  `.schema [table]`, `.commits [n]`, `.snapshot [off]`, `.check`, `.checkpoint`,
+  `.help`, `.exit` / `.quit`.
 - **After a crash**, the banner says how many transactions were recovered from the log.
 - **Transactions:** the prompt is `glassdb*>` while one is open. Leaving with one
   open rolls it back and prints `open transaction rolled back`.
+- **Snapshots:** `.snapshot` pins a `Reader` to the latest commit, and the prompt
+  becomes `glassdb@12>`. Plain `SELECT`s and `EXPLAIN SELECT`s then go to the
+  reader, while writes and anything with its own `AS OF` or `HISTORY` go to the
+  database, so you can write and watch the snapshot stay put.
 - **Keys:** Ctrl-C drops a half-typed statement. Ctrl-D (end of input) runs
   anything left unfinished, then exits with code 0. So `glassdb my.db < script.sql` works.
 - **Code layout:** `repl.rs` (statement buffering) and `render.rs` (tables)
@@ -74,12 +79,13 @@ Every page is **4096 bytes**. Page `n` starts at byte `n × 4096`. All integers 
 | Bytes | Field | Notes |
 | --- | --- | --- |
 | 0–8 | magic | `GLASSDB\0` |
-| 8–10 | format version | `1` |
+| 8–10 | format version | `2`; `1` was the format before row versions |
 | 10–12 | page size | `4096`; a file with another size is refused |
 | 12–16 | page count | Includes the header page, so an empty database has 1 |
 | 16–20 | free-list head | First free page id; `0` = list is empty |
 | 20–24 | free count | Number of pages on the free list |
-| 24–4096 | zero | Reserved |
+| 24–32 | history floor | Oldest transaction `AS OF` can reach; `0` until the first vacuum |
+| 32–4096 | zero | Reserved |
 
 On open, the header is rejected if any of these hold:
 - the magic, version or page size is wrong
@@ -576,8 +582,9 @@ database file, or fails at once with `Error::Locked`. It's held until the
 This is stricter than the "one writer at a time" a database needs in the end, and
 it's needed anyway. Opening a database checkpoints and empties its log, so a second
 open would destroy a running writer's log. Sharing a file between programs safely
-would take a shared index of the log, like SQLite's `-shm` file, and readers that
-stay stable while a writer runs. Phase 7's row versions are the place to revisit that.
+would take a shared index of the log, like SQLite's `-shm` file. Readers that stay
+stable while a writer runs exist now, but [only inside one process](#readers), so
+this decision stands.
 
 Within one process, `Database::run` takes `&mut self`, so Rust already allows only
 one writer. A second `Database` on the same file is refused like any other.
@@ -825,6 +832,251 @@ by hand with `cargo run --release -p glassdb-core --example index_bench`.
   Moving a range bound outward isn't a bug under the rule above: `WHERE` filters the
   extra rows out. Only a bound that misses rows was planted.
 
+## Time travel
+
+Old rows are kept, so a query can ask for any past moment. `AS OF` and
+[readers](#readers) are the same feature: a snapshot is just `AS OF` with the
+moment chosen for you.
+
+```sql
+SELECT * FROM accounts AS OF '2026-11-01 10:00';
+SELECT * FROM accounts AS OF TXN 412;
+SELECT * FROM accounts HISTORY WHERE id = 7;
+VACUUM HISTORY BEFORE '2026-10-01';
+```
+
+### Row versions
+
+Every table has two B+ trees:
+
+```text
+table tree     rowid                -> created_by, row     the current rows
+history tree   rowid + created_by   -> deleted_by, row     replaced versions
+```
+
+- An `UPDATE` or `DELETE` moves the old version into the history tree, stamped with
+  the transaction that replaced it. The new version takes its place in the table
+  tree, stamped with the same transaction.
+- A history key is the 8-byte row id then `created_by` as 8 big-endian bytes, so a
+  row's versions sit together, oldest first. Stamps in values are little-endian.
+- **The rule:** a version is visible at transaction `n` if `created_by <= n` and it
+  has no `deleted_by`, or `deleted_by > n`. At most one version of a row passes.
+
+**Decision: a separate history tree**, not old versions mixed into the table tree.
+The plan's "every write creates a new version" still holds, but the current rows
+stay together. Today's queries, the planner and the indexes never meet an old
+version, so a table with a long history scans as fast as one without. The price is
+that a past read must look in both trees and can't use a secondary index.
+
+**A version no moment can see is never stored.** If a transaction changes a row
+that it wrote itself, the row is simply overwritten. Moments fall between
+transactions, so nothing could ever have seen the in-between value. A row made and
+deleted in one transaction leaves nothing at all. This also means `(rowid,
+created_by)` is unique, and writing it twice is reported as corruption.
+
+A changed primary key is a delete and an insert: the old row id's version ends, and
+a new row id begins. `HISTORY WHERE id = 7` shows versions that had that id.
+
+### Transaction ids and the commit log
+
+Each transaction that changed something gets the next id, counting from 1. Id 0 is
+the empty database. A read gets no id, nor does a statement that changed nothing,
+such as an `UPDATE` matching no rows, or a `VACUUM`, which no query can tell apart.
+
+The id is simply the last commit's plus one, so a rollback gives its id back: every
+version stamped with it is gone too. **So ids have no gaps,** which makes `AS OF TXN
+n` easy to reason about and allows the search below.
+
+The commit log is a B+ tree with its root fixed at **page 2**, mapping each id (8
+bytes, big-endian) to its commit time (8 bytes, little-endian). The entry is written
+just before the commit, so it reaches the write-ahead log in the same transaction
+as the changes it describes. A crash keeps both or neither. The next id isn't
+stored anywhere: it comes from the log's last entry on open.
+
+### Time
+
+A time is microseconds since 1970 in UTC, stored as an `i64`. The dates are worked
+out by hand in `time/`, since a timestamp is the only date in the engine.
+
+- **Text:** `YYYY-MM-DD[ HH:MM[:SS[.ffffff]]]`, then optionally `Z`, `+HH:MM` or
+  `-HH:MM`. A `T` may replace the space. A bad timestamp is a syntax error.
+- **Decision: UTC unless told otherwise.** Rust's standard library can't find the
+  local time zone, and a time zone database would be a dependency for one feature.
+  So `'2026-11-01 10:00 +05:30'` is how to say local time.
+- **Clock:** commit times come from a `Clock`, which tests replace with a
+  `ManualClock`. A browser has no system clock for Rust to ask, so Phase 8 needs
+  this too. `Database::set_clock` swaps it.
+- **Decision: commit times never go backwards.** A clock can be set back, so a
+  commit takes the later of the clock and the last commit's time. It's a small lie
+  about when a commit happened, but with it, times stay in id order, and `AS OF
+  '<time>'` can binary-search the commit log for the last commit at or before that
+  time. Two commits may share a time; the later one wins.
+
+### Reading the past
+
+`AS OF '<time>'` becomes a transaction id, and from there both forms are the same:
+
+1. Refuse an id that hasn't happened, or one vacuum has taken away.
+2. Find the table as it was then (see below).
+3. Plan with no indexes, because an index only holds current rows. The primary key
+   still works, as a range of both trees.
+4. Read both trees, keep the visible versions, and sort by row id.
+
+From there it's an ordinary `SELECT`. `EXPLAIN` shows `FULL SCAN t AS OF TXN 5`.
+
+`AS OF` a future time means the latest commit. A time before the first commit means
+transaction 0, when no table existed. There's no `ALTER TABLE`, so a table's columns
+never change and one schema fits all of its versions.
+
+`HISTORY` adds four columns: `created_txn`, `created_at`, `deleted_txn` and
+`deleted_at`. They're real columns of a wider table built just for the query, so
+`WHERE`, `ORDER BY` and the rest need no special handling. A table with a column of
+one of those names can't use `HISTORY`. Stamps from a transaction still open show a
+NULL time. `HISTORY` shows only the table that holds that name now.
+
+### Dropped tables
+
+**Decision: `DROP TABLE` keeps the rows until vacuum.** Otherwise a drop would rewrite
+the past, and a reader's table could vanish while it was looking.
+
+- The catalog entry moves to the key `name`, a zero byte, then the dropping
+  transaction. No name holds a zero byte, so the name is free for a new table, and
+  one name can have any number of dropped tables.
+- A past read takes the live table if it existed by then, or else a dropped one that
+  existed then, with the same visibility rule.
+- Indexes go at once, since nothing in the past uses them.
+- A table made and dropped in one transaction is destroyed at once, by the same
+  rule as other versions no moment can see.
+
+So `DROP TABLE` no longer gives space back. `VACUUM HISTORY` does.
+
+### VACUUM HISTORY
+
+`VACUUM HISTORY BEFORE '<time>'` finds the last commit at or before that time, say
+`v`. It deletes history versions with `deleted_by <= v`, which only moments before
+`v` could see, and removes tables dropped by `v`. The moment `v` itself stays exact.
+
+**Decision: the past fails loudly.** Vacuum stores `v` in the header as the **history
+floor**, and `AS OF` anything older is an error. Without the floor, a query would
+quietly return a mix of rows.
+
+- The floor is in the header, so it commits and rolls back with the vacuum. It only
+  rises.
+- Vacuum is refused inside a transaction, and if a reader is at an older moment.
+- It scans every history tree, so it costs time proportional to the history.
+- The commit log isn't trimmed, because current rows still refer to old ids. It costs
+  about 16 bytes per commit.
+
+### Readers
+
+```rust
+let reader = db.reader()?;          // pinned to the latest commit
+thread::spawn(move || reader.query("SELECT * FROM accounts"));
+```
+
+A `Reader` can move to another thread and stays at its moment until it's dropped or
+told to `refresh()`. It takes only `SELECT` and `EXPLAIN SELECT`, and turns each into
+`AS OF TXN n`. `Database` and `Reader` share one `Engine` behind a mutex.
+
+**Readers never see a write in progress.** The stamps do this with no extra machinery.
+A reader runs between a writer's statements and can read its uncommitted pages, even
+ones spilled to the log, but those carry an id newer than the reader's moment, so
+they're invisible, and the old versions they replaced are visible in the history
+tree. A rollback changes nothing a reader could see. A checkpoint moves pages, not
+versions.
+
+**Decision: in one process, with a mutex.** The plan's line that readers never wait
+for the writer is true of transactions, not of single statements: a reader takes
+the mutex for one statement, so it waits while a write statement runs, and a write
+waits for it. It never waits for `COMMIT`. Doing better would need a reader to run
+over a page snapshot of its own. Other programs still get `Error::Locked`, as
+[the lock](#the-lock) explains.
+
+**After a disk error** a statement may be half-written, which stamps can't hide, so
+readers get an error until `ROLLBACK` clears it, like the writer does.
+
+**Closing:** `Database::close` ends all readers, and they report `the database is
+closed` from then on. A reader can't keep the file locked after its database goes.
+
+### Events
+
+| Event | When |
+| --- | --- |
+| `Committed { txn, time }` | A transaction took its id and commit time |
+| `VersionKept { rowid, created, deleted }` | An old version moved to the history tree |
+| `PastRead { txn, visible, hidden }` | A past read kept `visible` of the versions it looked at |
+| `Vacuumed { txn, versions, tables }` | Vacuum finished; `txn` is the new floor |
+
+### Limits
+
+- **Past reads scan.** With no index, `AS OF` is a full scan of both trees unless the
+  primary key narrows it, and a long history makes that slower. Reader queries are
+  past reads too, so they can't use secondary indexes either.
+- **Writes cost more.** Each `UPDATE` or `DELETE` writes a row twice, and every commit
+  adds a log entry. The [numbers are below](#testing-3).
+- **History grows until vacuumed.** Nothing trims it automatically.
+- **`HISTORY` can't reach a dropped table,** though `AS OF` can.
+- **Timestamps are text.** There is no date type, so `created_at` sorts as text,
+  which happens to be time order for years 1000 to 9999.
+- **Old files are refused.** A version 1 file gives `file format version 1 isn't
+  supported`. There's no conversion, because nothing has been released yet.
+
+### Testing
+
+**Exact past states** (`tests/history_props.rs`, the model in `tests/history_model/`).
+Random inserts, updates, deletes, moved keys, transactions, rollbacks, drops, vacuums,
+pinned readers and reopens run against the engine and a plain model, which saves its
+whole state at every commit. Afterwards every past transaction is compared by id, by
+time, by primary key and by rebuilding it from `HISTORY`'s stamps. That's 48 random
+runs of up to 120 operations and one of 1,500.
+
+**Stable snapshots** (`tests/snapshot.rs`). Real threads read a bank's accounts while a
+writer moves money across two statements in a transaction. Readers pinned before the
+writer starts must see the opening balances on every read. A reader that follows
+each commit must see the total add up every time, which it wouldn't if it ever
+caught a transfer half-way. A third test proves a read finishes while a transaction
+stays open, by only committing once the answer has arrived.
+
+**Crashes.** After every power cut, three past moments must match a clean run, and
+the workload now includes a `VACUUM`. After every one of the 200 kills, three moments
+recorded in earlier rounds must read back exactly. `check` also proves each table's
+versions don't overlap, and that the commit log has no gaps and runs forwards.
+
+**Planted bugs.** 42 bugs were put in by hand, one at a time, across visibility, key
+ranges, stamps, the commit log, dropped tables, vacuum, the floor and readers. 41 were
+caught. The other changed a line of `CommitLog::check` that turned out to be
+redundant: a gap in the ids also makes the log too short, which a second test catches,
+so it changed which line reports the problem, not what's reported. By suite, of the 41:
+
+| Suite | Caught alone or with others |
+| --- | --- |
+| Unit tests | 39 |
+| Comparison with the model | 28 (29 once it also read past rows by primary key) |
+| SQL files | 14 |
+| Threaded snapshot tests | 10 |
+
+The power-cut and kill tests each caught the three durability bugs they were tried on:
+a commit log entry written after its commit, and an `UPDATE` or a `DELETE` that lost
+its old version. The power-cut test also caught a floor that wasn't stored.
+
+**Cost**, in release mode on a Mac, against the same workload on the previous commit:
+
+| | Before | With history |
+| --- | --- | --- |
+| Insert 100,000 rows | 1.7 s | 1.7 s |
+| 20,000 updates in 200 commits | 1.76 s | 2.05 s (+17%) |
+| Delete 10,000 rows | 59 ms | 102 ms (+73%) |
+| File with 100,000 rows | 11.6 MB | 13.1 MB (+13%, the 8-byte stamp) |
+| File after those updates and deletes | 11.6 MB | 16.6 MB |
+
+Reading is barely touched: a million-row lookup still takes about 21 µs through an index
+and 14 µs by primary key. With 30,000 old versions beside 90,000 current rows, a full
+scan took 18 ms for the present and 26 ms `AS OF`, and 1,000 primary key lookups took
+10 ms and 13 ms. Vacuum removed those versions in 105 ms and put 1,228 of 4,259 pages
+on the free list. The file doesn't shrink: freed pages are reused by later writes.
+
+Try it with `cargo run --release -p glassdb-core --example history_bench`.
+
 ## SQL
 
 ### Statements
@@ -843,6 +1095,10 @@ ROLLBACK
 CREATE INDEX [IF NOT EXISTS] i ON t (col, ...)
 DROP INDEX [IF EXISTS] i
 EXPLAIN SELECT ... | UPDATE ... | DELETE ...
+SELECT ... FROM t AS OF '<timestamp>' ...
+SELECT ... FROM t AS OF TXN n ...
+SELECT ... FROM t HISTORY ...
+VACUUM HISTORY BEFORE '<timestamp>'
 ```
 
 - **Types:** `INT` (also spelled `INTEGER`), `REAL`, `TEXT`, `BOOL` (also
@@ -910,9 +1166,10 @@ EXPLAIN SELECT ... | UPDATE ... | DELETE ...
 
 ### Rows and keys on disk
 
-Each table is a B+ tree. The **key** is the row id as 8 bytes. The sign bit
-is flipped and the bytes are written big-endian, so byte order equals numeric
-order (property-tested for all `i64`). The **value** is the row:
+Each table's current rows are in a B+ tree. The **key** is the row id as 8 bytes.
+The sign bit is flipped and the bytes are written big-endian, so byte order equals
+numeric order (property-tested for all `i64`). The **value** is the transaction
+that wrote the row (8 bytes, little-endian), then the row:
 
 | Bytes | Field |
 | --- | --- |
@@ -928,9 +1185,10 @@ order (property-tested for all `i64`). The **value** is the row:
 | 4 | BOOL | 1 byte |
 
 - Decoding checks every length, and rejects extra bytes and unknown tags.
-- A row may be at most `MAX_ENTRY - 8` = 992 bytes (the B+ tree's entry limit
-  minus the key). Larger rows are rejected with `row too large`. Overflow
-  pages would lift this.
+- A row may be at most 976 bytes: the B+ tree's 1000-byte entry limit, minus the
+  16-byte key and 8-byte stamp it has in the [history tree](#time-travel), which is
+  tighter than the table tree. Larger rows are rejected with `row too large`.
+  Overflow pages would lift this.
 
 **Decision: `INT PRIMARY KEY` is the row id** (as in SQLite).
 - The primary key's value is the B+ tree key, so it is unique by
@@ -945,8 +1203,15 @@ order (property-tested for all `i64`). The **value** is the row:
   database is new (only the header exists, so the first allocated page is 1).
   Because a tree's root never moves, page 1 stays the catalog. The file header
   needed no change.
-- Each entry maps a table or index name to its root page (4 bytes, little-endian)
-  followed by its `CREATE TABLE` or `CREATE INDEX` statement as tidy SQL.
+- Each entry maps a table or index name to 24 bytes of numbers (little-endian),
+  followed by its `CREATE TABLE` or `CREATE INDEX` statement as tidy SQL:
+
+  | Bytes | Field |
+  | --- | --- |
+  | 0–4 | root page |
+  | 4–8 | history tree root page, `0` for an index |
+  | 8–16 | transaction that created it |
+  | 16–24 | transaction that dropped it, `0` while it exists |
 - On every lookup the SQL is parsed again to rebuild the schema, as SQLite
   does. The schema stays human-readable, and `.schema` prints it straight back.
 - Opening a file reads page 1 at once, so a file without a valid catalog fails
@@ -954,8 +1219,10 @@ order (property-tested for all `i64`). The **value** is the row:
 - `CREATE TABLE` checks the definition before allocating anything: an
   existing table, duplicate columns, more than one primary key, or a non-INT
   primary key are all rejected.
-- `DROP TABLE` frees every page of the table and its indexes with
-  `BTree::destroy()`, then removes the catalog entries.
+- `DROP TABLE` frees its indexes with `BTree::destroy()` at once, but
+  [keeps its rows](#dropped-tables) until `VACUUM HISTORY`.
+- An entry must fit under the longer key a dropped table gets, so a definition
+  too long for that is refused at `CREATE`, and `DROP` can't run out of room.
 
 ### Executor
 
@@ -968,6 +1235,7 @@ for statement in sql::parse(script)? { db.run(&statement)?; }
 db.close()?;
 ```
 
+`Database` and `Reader` are handles on a shared `Engine`, where the work happens.
 `Output` is `Message` (CREATE/DROP and transaction statements), `Inserted(n)`,
 `Updated(n)`, `Deleted(n)`, or `Rows { columns, rows }` (SELECT and EXPLAIN).
 

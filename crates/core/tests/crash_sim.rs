@@ -9,16 +9,35 @@
 //! and sync in turn. After each cut the database must reopen, pass `check`,
 //! and hold exactly the state after the last confirmed statement, or after
 //! the one in flight. It must never hold a partly applied statement, or
-//! anything from a transaction that rolled back or never committed.
+//! anything from a transaction that rolled back or never committed. Moments
+//! from the past must also come back exactly, because old row versions and
+//! the commit log are written just like everything else.
 
 use std::io;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use glassdb_core::{Database, Error, MemStorage, NoopTracer, Result, Storage};
+use glassdb_core::time::format_timestamp;
+use glassdb_core::{Clock, Database, Error, MemStorage, NoopTracer, Result, Storage};
 
 const SEEDS: [u64; 3] = [1, 0x9E37_79B9, 0xDEAD_BEEF];
 /// A small cache, so big statements spill uncommitted pages to the log.
 const FRAMES: usize = 4;
+
+const START: i64 = 1_793_534_400_000_000; // 2026-11-01 12:00:00 UTC
+const SECOND: i64 = 1_000_000;
+/// The workload's VACUUM keeps moments from this transaction on.
+const VACUUM_TXN: u64 = 12;
+
+/// A clock one second further on each time it's asked. Only a commit asks, so
+/// the same workload always gets the same commit times.
+struct TickingClock(AtomicI64);
+
+impl Clock for TickingClock {
+    fn now(&self) -> i64 {
+        self.0.fetch_add(SECOND, Ordering::Relaxed)
+    }
+}
 
 #[derive(Clone)]
 enum Op {
@@ -134,7 +153,9 @@ impl Disk {
     }
 
     fn open(&self) -> Result<Database> {
-        Database::open_with(self.file(0), self.file(1), FRAMES, Arc::new(NoopTracer))
+        let mut db = Database::open_with(self.file(0), self.file(1), FRAMES, Arc::new(NoopTracer))?;
+        db.set_clock(Arc::new(TickingClock(AtomicI64::new(START + SECOND))));
+        Ok(db)
     }
 
     /// What is left on the platters after the power cut.
@@ -280,6 +301,12 @@ fn workload() -> Vec<Step> {
             steps.push(Step::Sql("UPDATE a SET n = n + 1".into()));
             steps.push(Step::Sql("COMMIT".into()));
         }
+        if g == 10 {
+            // Txn n commits at START + n seconds, so this frees old versions,
+            // and the tables dropped so far, for the power cuts to land in.
+            let time = format_timestamp(START + VACUUM_TXN as i64 * SECOND);
+            steps.push(Step::Sql(format!("VACUUM HISTORY BEFORE '{time}'")));
+        }
         if g % 8 == 5 {
             steps.push(Step::Sql("BEGIN".into()));
             steps.push(Step::Sql("CREATE TABLE ghost (y TEXT)".into()));
@@ -311,8 +338,30 @@ fn contents(db: &mut Database) -> String {
     out
 }
 
-/// Reopen what survived, verify it, and return its contents.
-fn reopen_and_check(images: [Vec<u8>; 2]) -> String {
+/// What every table held at transaction `txn`, in the same form as `contents`.
+/// `None` if vacuum has taken that moment away.
+fn contents_at(db: &mut Database, txn: u64, tables: &[String]) -> Option<String> {
+    let mut out = String::new();
+    for table in tables {
+        let rows = match db.execute(&format!("SELECT * FROM {table} AS OF TXN {txn}")) {
+            Ok(rows) => rows,
+            Err(err) if err.to_string().contains("vacuumed") => return None,
+            Err(err) => panic!("{table} at txn {txn}: {err}"),
+        };
+        out.push_str(&format!("{table}:\n{rows}\n"));
+    }
+    Some(out)
+}
+
+/// One committed moment of the clean run.
+struct Moment {
+    tables: Vec<String>,
+    contents: String,
+}
+
+/// Reopen what survived, verify it, and return its contents. A few of its past
+/// moments, picked by `pick`, must match the clean run's exactly.
+fn reopen_and_check(images: [Vec<u8>; 2], past: &[Moment], pick: u64) -> String {
     let [db, wal] = images;
     let mut db = Database::open_with(
         Box::new(MemStorage::from_bytes(db)),
@@ -323,6 +372,14 @@ fn reopen_and_check(images: [Vec<u8>; 2]) -> String {
     .expect("the database must open after a power cut");
     db.check()
         .expect("the database must be intact after a power cut");
+    let latest = db.latest_txn().unwrap();
+    for txn in [latest, latest.saturating_sub(1), pick % (latest + 1)] {
+        let moment = &past[txn as usize];
+        match contents_at(&mut db, txn, &moment.tables) {
+            Some(found) => assert_eq!(found, moment.contents, "txn {txn} changed"),
+            None => assert!(txn < VACUUM_TXN, "vacuum took txn {txn}"),
+        }
+    }
     contents(&mut db)
 }
 
@@ -335,6 +392,10 @@ fn power_cuts_at_every_disk_operation() {
     let disk = Disk::new([Vec::new(), Vec::new()], u64::MAX, 1);
     let mut db = disk.open().unwrap();
     let mut states = vec![contents(&mut db)];
+    let mut past = vec![Moment {
+        tables: Vec::new(),
+        contents: String::new(),
+    }];
     for step in &steps {
         run(&mut db, step).unwrap();
         let state = if db.in_transaction() {
@@ -342,6 +403,12 @@ fn power_cuts_at_every_disk_operation() {
         } else {
             contents(&mut db)
         };
+        if !db.in_transaction() && db.latest_txn().unwrap() == past.len() as u64 {
+            past.push(Moment {
+                tables: db.tables().unwrap().into_iter().map(|t| t.name).collect(),
+                contents: state.clone(),
+            });
+        }
         states.push(state);
     }
     db.close().unwrap();
@@ -369,7 +436,7 @@ fn power_cuts_at_every_disk_operation() {
                 Err(_) => again.survivors(),
             };
 
-            let found = reopen_and_check(images);
+            let found = reopen_and_check(images, &past, seed ^ cut.wrapping_mul(0x9E37_79B9));
             assert!(
                 !found.contains("ghost"),
                 "seed {seed}, cut at operation {cut}: a rolled-back change came back"

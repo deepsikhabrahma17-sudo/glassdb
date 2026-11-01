@@ -2,25 +2,37 @@
 //! schema survives restarts.
 //!
 //! The catalog tree's root is always page 1 (a tree's root page never moves).
-//! Each entry maps a table or index name to:
+//! Each entry maps a table or index name to (integers little-endian):
 //!
-//! | bytes | field                                                        |
-//! |-------|--------------------------------------------------------------|
-//! | 0..4  | its root page (u32, little-endian)                           |
-//! | 4..   | its `CREATE TABLE` or `CREATE INDEX` statement, as tidy SQL  |
+//! | bytes  | field                                                       |
+//! |--------|-------------------------------------------------------------|
+//! | 0..4   | its root page                                               |
+//! | 4..8   | a table's history tree root page (0 for an index)           |
+//! | 8..16  | the transaction that created it                             |
+//! | 16..24 | the transaction that dropped it (0 while it exists)         |
+//! | 24..   | its `CREATE TABLE` or `CREATE INDEX` statement, as tidy SQL |
 //!
 //! The SQL is parsed again to rebuild the schema, as SQLite does, and also
 //! says which kind of entry it is. Tables and indexes share one set of names.
+//! A dropped table keeps its entry under a different key (see `dropped`).
 //! Nothing is kept in memory, so a rollback needs no help here.
+
+mod dropped;
 
 #[cfg(test)]
 mod tests;
 
-use crate::btree::BTree;
+use crate::btree::{BTree, MAX_ENTRY, MAX_KEY};
 use crate::error::{Error, Result};
+use crate::mvcc::TxnId;
 use crate::pager::{PageId, Pager};
 use crate::sql::{ColumnDef, CreateIndex, CreateTable, Statement, parse_one};
 use crate::types::DataType;
+pub use dropped::DroppedTable;
+use dropped::{DROPPED_KEY_EXTRA, is_dropped_key, name_of_dropped_key};
+
+/// Bytes before the SQL in a catalog entry.
+const ENTRY_HEADER: usize = 24;
 
 /// The catalog tree's root page.
 pub const CATALOG_ROOT: PageId = 1;
@@ -29,8 +41,12 @@ pub const CATALOG_ROOT: PageId = 1;
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableSchema {
     pub name: String,
-    /// Root page of the B+ tree holding the table's rows.
+    /// Root page of the B+ tree holding the table's current rows.
     pub root: PageId,
+    /// Root page of the B+ tree holding its replaced row versions.
+    pub history_root: PageId,
+    /// The transaction that created the table.
+    pub created: TxnId,
     pub columns: Vec<ColumnDef>,
 }
 
@@ -82,6 +98,7 @@ impl IndexSchema {
 enum Entry {
     Table(TableSchema),
     Index(IndexSchema),
+    Dropped(DroppedTable),
 }
 
 pub struct Catalog {
@@ -115,8 +132,11 @@ impl Catalog {
     fn entries(&self, pager: &mut Pager) -> Result<Vec<Entry>> {
         let mut entries = Vec::new();
         for entry in self.tree.iter(pager)? {
-            let (name, value) = entry?;
-            let name = String::from_utf8_lossy(&name).into_owned();
+            let (key, value) = entry?;
+            let name = match is_dropped_key(&key) {
+                true => name_of_dropped_key(&key),
+                false => String::from_utf8_lossy(&key).into_owned(),
+            };
             entries.push(decode_entry(&name, &value)?);
         }
         Ok(entries)
@@ -144,7 +164,7 @@ impl Catalog {
         Ok(tables
             .filter_map(|entry| match entry {
                 Entry::Table(table) => Some(table),
-                Entry::Index(_) => None,
+                _ => None,
             })
             .collect())
     }
@@ -155,7 +175,7 @@ impl Catalog {
         Ok(indexes
             .filter_map(|entry| match entry {
                 Entry::Index(index) => Some(index),
-                Entry::Table(_) => None,
+                _ => None,
             })
             .collect())
     }
@@ -169,25 +189,21 @@ impl Catalog {
 
     fn check_name_is_free(&self, pager: &mut Pager, name: &str) -> Result<()> {
         let kind = match self.entry(pager, name)? {
-            None => return Ok(()),
+            None | Some(Entry::Dropped(_)) => return Ok(()),
             Some(Entry::Table(_)) => "table",
             Some(Entry::Index(_)) => "index",
         };
         Err(Error::Query(format!("{kind} {name} already exists")))
     }
 
-    /// Store a new entry. If it doesn't fit, its new tree is freed again.
-    fn record(&self, pager: &mut Pager, name: &str, tree: BTree, sql: &str) -> Result<()> {
-        let mut entry = tree.root().to_le_bytes().to_vec();
-        entry.extend(sql.as_bytes());
-        if let Err(err) = self.tree.insert(pager, name.as_bytes(), &entry) {
-            tree.destroy(pager)?;
-            return match err {
-                Error::EntryTooLarge { .. } => Err(Error::Query(format!(
-                    "the definition of {name} is too long"
-                ))),
-                other => Err(other),
-            };
+    /// Whether an entry for `name` fits, now and under the longer key it would
+    /// get if it were dropped, so a later `DROP TABLE` can't fail for space.
+    fn check_size(name: &str, sql: &str) -> Result<()> {
+        let key = name.len() + DROPPED_KEY_EXTRA;
+        if key > MAX_KEY || key + ENTRY_HEADER + sql.len() > MAX_ENTRY {
+            return Err(Error::Query(format!(
+                "the definition of {name} is too long"
+            )));
         }
         Ok(())
     }
@@ -212,15 +228,23 @@ impl Catalog {
     }
 
     /// Give a checked index an empty B+ tree and record it.
-    pub fn create_index(&self, pager: &mut Pager, def: &CreateIndex) -> Result<IndexSchema> {
-        let tree = BTree::create(pager)?;
-        let index = IndexSchema {
+    pub fn create_index(
+        &self,
+        pager: &mut Pager,
+        def: &CreateIndex,
+        txn: TxnId,
+    ) -> Result<IndexSchema> {
+        let mut index = IndexSchema {
             name: def.name.clone(),
             table: def.table.clone(),
-            root: tree.root(),
+            root: 0,
             columns: def.columns.clone(),
         };
-        self.record(pager, &index.name, tree, &index.create_sql())?;
+        let sql = index.create_sql();
+        Self::check_size(&index.name, &sql)?;
+        index.root = BTree::create(pager)?.root();
+        let entry = encode_entry(index.root, 0, txn, 0, &sql);
+        self.tree.insert(pager, index.name.as_bytes(), &entry)?;
         Ok(index)
     }
 
@@ -234,8 +258,8 @@ impl Catalog {
         Ok(Some(index))
     }
 
-    /// Check a new table's definition, give it an empty B+ tree, and record it.
-    pub fn create(&self, pager: &mut Pager, def: &CreateTable) -> Result<TableSchema> {
+    /// Check a new table's definition, give it empty B+ trees, and record it.
+    pub fn create(&self, pager: &mut Pager, def: &CreateTable, txn: TxnId) -> Result<TableSchema> {
         let fail = |msg: String| Err(Error::Query(msg));
         self.check_name_is_free(pager, &def.name)?;
         for (i, column) in def.columns.iter().enumerate() {
@@ -256,13 +280,19 @@ impl Catalog {
             ));
         }
 
-        let table = BTree::create(pager)?;
-        let schema = TableSchema {
+        let mut schema = TableSchema {
             name: def.name.clone(),
-            root: table.root(),
+            root: 0,
+            history_root: 0,
+            created: txn,
             columns: def.columns.clone(),
         };
-        self.record(pager, &schema.name, table, &schema.create_sql())?;
+        let sql = schema.create_sql();
+        Self::check_size(&schema.name, &sql)?;
+        schema.root = BTree::create(pager)?.root();
+        schema.history_root = BTree::create(pager)?.root();
+        let entry = encode_entry(schema.root, schema.history_root, txn, 0, &sql);
+        self.tree.insert(pager, schema.name.as_bytes(), &entry)?;
         Ok(schema)
     }
 
@@ -271,36 +301,51 @@ impl Catalog {
         let stats = self.tree.check(pager)?;
         Ok(stats.internal_nodes + stats.leaves)
     }
+}
 
-    /// Remove a table and its indexes, and free all of their pages. Returns
-    /// the table, if it existed.
-    pub fn drop(&self, pager: &mut Pager, name: &str) -> Result<Option<TableSchema>> {
-        let Some(schema) = self.get(pager, name)? else {
-            return Ok(None);
-        };
-        for index in self.indexes_of(pager, name)? {
-            self.drop_index(pager, &index.name)?;
-        }
-        BTree::open(schema.root).destroy(pager)?;
-        self.tree.delete(pager, name.as_bytes())?;
-        Ok(Some(schema))
-    }
+/// A catalog entry's bytes.
+fn encode_entry(
+    root: PageId,
+    history_root: PageId,
+    created: TxnId,
+    dropped: TxnId,
+    sql: &str,
+) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(ENTRY_HEADER + sql.len());
+    entry.extend(root.to_le_bytes());
+    entry.extend(history_root.to_le_bytes());
+    entry.extend(created.to_le_bytes());
+    entry.extend(dropped.to_le_bytes());
+    entry.extend(sql.as_bytes());
+    entry
 }
 
 /// Rebuild a table or index from its catalog entry.
 fn decode_entry(name: &str, entry: &[u8]) -> Result<Entry> {
     let corrupt = |why: &str| Error::Corrupt(format!("catalog entry for {name}: {why}"));
-    if entry.len() < 4 {
+    if entry.len() < ENTRY_HEADER {
         return Err(corrupt("too short"));
     }
     let root = PageId::from_le_bytes(entry[..4].try_into().unwrap());
-    let sql = std::str::from_utf8(&entry[4..]).map_err(|_| corrupt("SQL is not UTF-8"))?;
+    let history_root = PageId::from_le_bytes(entry[4..8].try_into().unwrap());
+    let created = TxnId::from_le_bytes(entry[8..16].try_into().unwrap());
+    let dropped = TxnId::from_le_bytes(entry[16..24].try_into().unwrap());
+    let sql = std::str::from_utf8(&entry[ENTRY_HEADER..]);
+    let sql = sql.map_err(|_| corrupt("SQL is not UTF-8"))?;
     match parse_one(sql) {
-        Ok(Statement::CreateTable(def)) if def.name == name => Ok(Entry::Table(TableSchema {
-            name: def.name,
-            root,
-            columns: def.columns,
-        })),
+        Ok(Statement::CreateTable(def)) if def.name == name => {
+            let schema = TableSchema {
+                name: def.name,
+                root,
+                history_root,
+                created,
+                columns: def.columns,
+            };
+            Ok(match dropped {
+                0 => Entry::Table(schema),
+                dropped => Entry::Dropped(DroppedTable { schema, dropped }),
+            })
+        }
         Ok(Statement::CreateIndex(def)) if def.name == name => Ok(Entry::Index(IndexSchema {
             name: def.name,
             table: def.table,

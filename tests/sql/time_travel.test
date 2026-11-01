@@ -1,0 +1,189 @@
+# AS OF TXN, HISTORY and dropped tables, before and after restarts. Times are
+# tested in Rust, where a test can choose the clock. Each commit takes the next
+# transaction id, so the ids below can be counted by eye.
+
+statement ok
+CREATE TABLE accounts (id INT PRIMARY KEY, owner TEXT, balance INT)
+
+statement ok
+INSERT INTO accounts VALUES (1, 'ada', 100), (2, 'bob', 50)
+
+statement ok
+UPDATE accounts SET balance = 80 WHERE id = 1
+
+statement ok
+INSERT INTO accounts VALUES (3, 'cy', 10)
+
+statement ok
+DELETE FROM accounts WHERE id = 2
+
+# Txn 1 made the table, so it was empty then.
+
+query
+SELECT * FROM accounts AS OF TXN 1
+----
+id | owner | balance
+
+query
+SELECT * FROM accounts AS OF TXN 2
+----
+id | owner | balance
+1 | ada | 100
+2 | bob | 50
+
+query
+SELECT * FROM accounts AS OF TXN 3
+----
+id | owner | balance
+1 | ada | 80
+2 | bob | 50
+
+query
+SELECT * FROM accounts AS OF TXN 5
+----
+id | owner | balance
+1 | ada | 80
+3 | cy | 10
+
+query
+SELECT * FROM accounts
+----
+id | owner | balance
+1 | ada | 80
+3 | cy | 10
+
+# Everything after the clause still works on the past rows.
+
+query
+SELECT owner, balance * 2 AS twice FROM accounts AS OF TXN 2 WHERE balance > 60 ORDER BY owner DESC LIMIT 1
+----
+owner | twice
+ada | 200
+
+query
+EXPLAIN SELECT * FROM accounts AS OF TXN 2 WHERE id = 1
+----
+plan
+PRIMARY KEY LOOKUP ON accounts (id = 1) AS OF TXN 2
+FILTER id = 1
+
+# HISTORY shows each version with the transactions that bound it.
+
+query
+SELECT id, balance, created_txn, deleted_txn FROM accounts HISTORY
+----
+id | balance | created_txn | deleted_txn
+1 | 100 | 2 | 3
+1 | 80 | 3 | NULL
+2 | 50 | 2 | 5
+3 | 10 | 4 | NULL
+
+query
+SELECT balance FROM accounts HISTORY WHERE id = 1 AND deleted_txn IS NOT NULL
+----
+balance
+100
+
+restart
+
+query
+SELECT * FROM accounts AS OF TXN 3
+----
+id | owner | balance
+1 | ada | 80
+2 | bob | 50
+
+# Txn 6 rolls back, so its id is free for the next commit.
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE accounts SET balance = 0
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE accounts SET balance = 1 WHERE id = 1
+
+statement ok
+UPDATE accounts SET balance = 2 WHERE id = 1
+
+statement ok
+INSERT INTO accounts VALUES (4, 'di', 40)
+
+statement ok
+DELETE FROM accounts WHERE id = 4
+
+statement error latest is 5
+SELECT * FROM accounts AS OF TXN 6
+
+statement ok
+COMMIT
+
+query
+SELECT id, balance, created_txn, deleted_txn FROM accounts HISTORY WHERE id >= 1 AND id < 2
+----
+id | balance | created_txn | deleted_txn
+1 | 100 | 2 | 3
+1 | 80 | 3 | 6
+1 | 2 | 6 | NULL
+
+# A dropped table stays readable. Its name is free for a new one.
+
+statement ok
+DROP TABLE accounts
+
+statement error no such table
+SELECT * FROM accounts
+
+statement error no table accounts at txn 7
+SELECT * FROM accounts AS OF TXN 7
+
+statement ok
+CREATE TABLE accounts (id INT PRIMARY KEY, note TEXT)
+
+query
+SELECT * FROM accounts AS OF TXN 8
+----
+id | note
+
+query
+SELECT owner FROM accounts AS OF TXN 6
+----
+owner
+ada
+cy
+
+restart
+
+query
+SELECT owner FROM accounts AS OF TXN 2
+----
+owner
+ada
+bob
+
+# Mistakes.
+
+statement error latest is 8
+SELECT * FROM accounts AS OF TXN 9
+
+statement error no table nothing at txn 1
+SELECT * FROM nothing AS OF TXN 1
+
+statement error no such table
+SELECT * FROM nothing HISTORY
+
+statement error no such column
+SELECT missing FROM accounts AS OF TXN 8
+
+statement error expected
+SELECT * FROM accounts AS OF
+
+statement error bad timestamp
+SELECT * FROM accounts AS OF 'tuesday'

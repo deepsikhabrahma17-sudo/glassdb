@@ -208,6 +208,7 @@ fn select_with_every_clause() {
     assert_eq!(
         parse_one(sql).unwrap(),
         Statement::Select(Select {
+            when: When::Now,
             items: vec![
                 SelectItem::Expr {
                     expr: col("a"),

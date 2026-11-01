@@ -25,13 +25,15 @@ pub struct Repl {
 }
 
 impl Repl {
-    /// The prompt, with a `*` while a transaction is waiting to end.
-    pub fn prompt(&self, in_transaction: bool) -> &'static str {
-        match (self.buffer.is_empty(), in_transaction) {
-            (true, false) => "glassdb> ",
-            (true, true) => "glassdb*> ",
-            (false, _) => "   ...> ",
+    /// The prompt, with `@n` while SELECTs read a snapshot of transaction `n`,
+    /// and a `*` while a transaction is waiting to end.
+    pub fn prompt(&self, in_transaction: bool, snapshot: Option<u64>) -> String {
+        if !self.buffer.is_empty() {
+            return "   ...> ".into();
         }
+        let at = snapshot.map_or(String::new(), |txn| format!("@{txn}"));
+        let star = if in_transaction { "*" } else { "" };
+        format!("glassdb{at}{star}> ")
     }
 
     pub fn feed(&mut self, line: &str) -> Action {
@@ -149,19 +151,26 @@ mod tests {
     #[test]
     fn prompt_shows_an_unfinished_statement() {
         let mut repl = Repl::default();
-        assert_eq!(repl.prompt(false), "glassdb> ");
+        assert_eq!(repl.prompt(false, None), "glassdb> ");
         repl.feed("SELECT");
-        assert_eq!(repl.prompt(false), "   ...> ");
+        assert_eq!(repl.prompt(false, None), "   ...> ");
         assert_eq!(repl.finish(), Some("SELECT".into()));
-        assert_eq!(repl.prompt(false), "glassdb> ");
+        assert_eq!(repl.prompt(false, None), "glassdb> ");
         assert_eq!(repl.finish(), None);
     }
 
     #[test]
     fn prompt_shows_an_open_transaction() {
         let mut repl = Repl::default();
-        assert_eq!(repl.prompt(true), "glassdb*> ");
+        assert_eq!(repl.prompt(true, None), "glassdb*> ");
         repl.feed("SELECT");
-        assert_eq!(repl.prompt(true), "   ...> ");
+        assert_eq!(repl.prompt(true, None), "   ...> ");
+    }
+
+    #[test]
+    fn prompt_shows_a_snapshot() {
+        let repl = Repl::default();
+        assert_eq!(repl.prompt(false, Some(12)), "glassdb@12> ");
+        assert_eq!(repl.prompt(true, Some(12)), "glassdb@12*> ");
     }
 }

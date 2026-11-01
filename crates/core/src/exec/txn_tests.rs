@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
-use crate::storage::MemStorage;
-use crate::trace::{Event, RecordingTracer};
+use crate::error::Result;
+use crate::storage::{MemStorage, Storage};
+use crate::trace::{Event, NoopTracer, RecordingTracer};
 
 /// A disk whose log can be made to fail on demand.
 struct FlakyLog {

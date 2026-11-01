@@ -27,7 +27,8 @@ together:
 > B+ tree) and a first SQL layer (tables, `SELECT`/`INSERT`/`UPDATE`/`DELETE`,
 > a catalog that survives restarts) work, a write-ahead log keeps them safe
 > through crashes, `BEGIN`/`COMMIT`/`ROLLBACK` group changes into transactions,
-> and indexes and a query planner make lookups fast. Time travel is next. See the
+> indexes and a query planner make lookups fast, and every change is kept, so any
+> past moment can be queried. The glass-box visualizer is next. See the
 > [roadmap](#roadmap).
 
 ## Contents
@@ -74,6 +75,34 @@ the next time you open it. Statements end with `;` and can span lines. Try
 cargo run -p glassdb -- demo.db < examples/demo.sql
 ```
 
+### Go back in time
+
+Every change is kept, and every commit gets a number and a time:
+
+```text
+glassdb> UPDATE students SET grade = 95 WHERE id = 1;
+updated 1 row
+glassdb> .commits 2
+txn 3  2026-11-01 09:15:02.481220
+txn 2  2026-11-01 09:14:40.102877
+glassdb> SELECT name, grade FROM students AS OF TXN 2 WHERE id = 1;
+ name | grade
+------+-------
+ Ada  |  91.5
+(1 row)
+glassdb> SELECT grade, created_txn, deleted_txn FROM students HISTORY WHERE id = 1;
+ grade | created_txn | deleted_txn
+-------+-------------+-------------
+  91.5 |           2 |           3
+  95.0 |           3 |        NULL
+(2 rows)
+```
+
+`AS OF '2026-11-01 09:15'` works with a time too, in UTC unless you add an offset
+such as `+05:30`. `VACUUM HISTORY BEFORE '<time>'` frees what only earlier moments
+could see. To watch a stable snapshot, run `.snapshot`, change some rows, and see
+`SELECT` carry on answering from that moment until `.snapshot off`.
+
 ### See the storage engine at work
 
 ```bash
@@ -118,6 +147,14 @@ The index tour builds indexes on 5,000 rows, shows what `EXPLAIN` picks for each
 kind of query, and counts the pages every plan reads.
 
 ```bash
+cargo run -p glassdb-core --example time_tour
+```
+
+The time-travel tour rewinds a table by transaction and by time, lists a row's
+versions, reads a dropped table, holds a reader still while a transaction runs,
+and shows what vacuum frees and what it refuses.
+
+```bash
 cargo run -p glassdb-core --example btree_tour
 ```
 
@@ -147,10 +184,12 @@ level, scans a range along the leaf chain, borrows, merges and shrinks back:
 | **Transactions** | `BEGIN`, `COMMIT` and `ROLLBACK`, including `CREATE TABLE` and `DROP TABLE`. A rolled-back transaction leaves no trace, even after a crash. A file lock means one program at a time has a database open |
 | **Indexes** | `CREATE INDEX` on one or more columns, kept in step on every write, and rolled back with everything else |
 | **Query planner** | Picks a primary key lookup, an index scan or a full scan for `SELECT`, `UPDATE` and `DELETE`. `EXPLAIN` shows the plan. An index changes speed, never results |
+| **Time travel** | Every change keeps the old row, stamped with the transactions that made and replaced it. `AS OF '<time>'`, `AS OF TXN <n>`, `HISTORY`, and `VACUUM HISTORY BEFORE '<time>'`. Dropped tables stay readable until vacuumed |
+| **Snapshot readers** | `db.reader()` pins a moment that other threads can read while a writer runs. A reader never sees uncommitted work and never waits for a `COMMIT` |
 | **Free list** | Freed pages are linked through themselves and reused before the file grows |
 | **Tracer** | Every layer reports events (hit, miss, evict, read, write). They cost nothing when tracing is off and will drive the visualizer |
 | **Storage** | A file on disk or a buffer in memory, behind one trait, so the same engine can run in a browser |
-| **CLI** | `glassdb <file>` is a SQL prompt: multi-line statements, aligned result tables, `.tables` / `.schema` / `.check` / `.checkpoint`, history |
+| **CLI** | `glassdb <file>` is a SQL prompt: multi-line statements, aligned result tables, `.tables` / `.schema` / `.commits` / `.snapshot` / `.check` / `.checkpoint`, line history |
 
 On a table of a million rows, a lookup takes about 120 ms with a full scan and
 about 21 µs through an index, in release mode on a Mac. Try it yourself:
@@ -184,7 +223,7 @@ flowchart TD
     TRACE -.-> VIZ["Glass-box visualizer"]
 
     classDef done fill:#d1fae5,stroke:#059669,color:#064e3b
-    class SQL,PLAN,BTREE,PAGER,DISK,UI,TRACE done
+    class SQL,PLAN,MVCC,BTREE,PAGER,DISK,UI,TRACE done
 ```
 
 Green layers exist today. The rest are on the [roadmap](#roadmap).
@@ -213,11 +252,13 @@ cargo test --workspace
 | Transaction property tests | `crates/core/tests/txn_props.rs` | Random transactions, crashes and restarts on a tiny cache always match an in-memory model |
 | Index comparison | `crates/core/tests/index_props.rs` | Random statements on an indexed and an unindexed database always give identical output |
 | Page counts | `crates/core/tests/index_speed.rs` | An index lookup reads a handful of pages where a scan reads hundreds |
+| Time-travel model | `crates/core/tests/history_props.rs` | Random statements, with the whole state saved at each commit. Every past transaction must come back exactly, by id, by time and through `HISTORY`, after vacuums and restarts |
+| Snapshot tests | `crates/core/tests/snapshot.rs` | Threads read a bank's accounts while a writer moves money between them. A pinned reader never sees anything change, every moment adds up, and a reader finishes while a transaction stays open |
 | SQL test files | `tests/sql/*.test` | Statements give exactly the expected output, before and after restarts (54 statements in `basics.test`) |
 | CLI tests | `crates/cli/tests/cli.rs` | The real binary runs SQL, prints tables, and refuses non-database files and files already open |
 | Lock tests | `crates/core/tests/lock.rs` | A second open is refused and leaves the log alone, and a crash frees the lock |
-| Power-cut tests | `crates/core/tests/crash_sim.rs` | A simulated disk loses or tears unsynced writes. The power is cut at every disk operation, and the database must recover exactly, with no rolled-back change coming back |
-| Kill tests | `crates/cli/tests/crash.rs` | The real binary gets `kill -9` at 200 random moments. Every confirmed statement survives, no statement or committed transaction is half-applied, and nothing rolled back appears |
+| Power-cut tests | `crates/core/tests/crash_sim.rs` | A simulated disk loses or tears unsynced writes. The power is cut at every disk operation, and the database must recover exactly, with no rolled-back change coming back and past moments still exact |
+| Kill tests | `crates/cli/tests/crash.rs` | The real binary gets `kill -9` at 200 random moments. Every confirmed statement survives, no statement or committed transaction is half-applied, nothing rolled back appears, and earlier moments still read back the same |
 
 Planned: parser fuzzing and benchmarks against SQLite.
 
@@ -232,10 +273,12 @@ glassdb/
 │   │   │   ├── wal/       write-ahead log: commits and recovery
 │   │   │   ├── sql/       tokenizer, parser, syntax tree
 │   │   │   ├── planner/   picks how to find a statement's rows
-│   │   │   ├── exec/      runs statements and transactions
+│   │   │   ├── exec/      runs statements, transactions and readers
+│   │   │   ├── mvcc/      row versions and the commit log (page 2)
 │   │   │   ├── catalog/   the list of tables and indexes (page 1)
 │   │   │   ├── types/     values, row and index key encoding
 │   │   │   ├── pager/     pages, header, buffer cache
+│   │   │   ├── time/      commit clock and timestamps
 │   │   │   ├── storage.rs file and in-memory storage
 │   │   │   ├── trace.rs   glass-box event stream
 │   │   │   └── error.rs
@@ -257,7 +300,7 @@ glassdb/
 - [x] **Write-ahead log:** checksummed frames, recovery, checkpoints
 - [x] **Transactions:** `BEGIN`, `COMMIT`, `ROLLBACK`, one open at a time
 - [x] **Indexes & planner:** `CREATE INDEX`, index scans, `EXPLAIN`
-- [ ] **Time travel:** `AS OF`, `HISTORY`, `VACUUM HISTORY`
+- [x] **Time travel:** `AS OF`, `HISTORY`, `VACUUM HISTORY`, snapshot readers
 - [ ] **Glass-box visualizer:** WASM build, live tree / cache / WAL / plan panels
 - [ ] **Polish:** benchmarks vs SQLite, hosted browser demo, crates.io release
 

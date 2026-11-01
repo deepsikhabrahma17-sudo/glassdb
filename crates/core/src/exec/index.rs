@@ -6,7 +6,7 @@
 //! statement's checking pass, so a value too long to index changes nothing.
 
 use super::select::scan;
-use super::{Database, Output};
+use super::{Engine, Output};
 use crate::btree::{BTree, MAX_KEY};
 use crate::catalog::{IndexSchema, TableSchema};
 use crate::error::{Error, Result};
@@ -55,12 +55,12 @@ impl Indexed {
 }
 
 /// The indexes on `table`, ready to write to.
-pub(super) fn open_all(db: &mut Database, table: &TableSchema) -> Result<Vec<Indexed>> {
+pub(super) fn open_all(db: &mut Engine, table: &TableSchema) -> Result<Vec<Indexed>> {
     let indexes = db.catalog.indexes_of(&mut db.pager, &table.name)?;
     indexes.iter().map(|i| Indexed::open(i, table)).collect()
 }
 
-pub(super) fn create(db: &mut Database, def: &CreateIndex) -> Result<Output> {
+pub(super) fn create(db: &mut Engine, def: &CreateIndex) -> Result<Output> {
     let name = &def.name;
     if def.if_not_exists && db.catalog.get_index(&mut db.pager, name)?.is_some() {
         return Ok(Output::Message(format!(
@@ -80,7 +80,9 @@ pub(super) fn create(db: &mut Database, def: &CreateIndex) -> Result<Output> {
     };
     let keys = keys_of(&Indexed::open(&index, &table)?, &table, db)?;
 
-    let index = db.catalog.create_index(&mut db.pager, def)?;
+    let txn = db.next_txn();
+    let index = db.catalog.create_index(&mut db.pager, def, txn)?;
+    db.wrote = true;
     let tree = BTree::open(index.root);
     for key in &keys {
         tree.insert(&mut db.pager, key, &[])?;
@@ -89,18 +91,21 @@ pub(super) fn create(db: &mut Database, def: &CreateIndex) -> Result<Output> {
 }
 
 /// Every key `index` should hold for `table`, sorted.
-fn keys_of(index: &Indexed, table: &TableSchema, db: &mut Database) -> Result<Vec<Vec<u8>>> {
+fn keys_of(index: &Indexed, table: &TableSchema, db: &mut Engine) -> Result<Vec<Vec<u8>>> {
     let mut keys = Vec::new();
-    for (key, row) in scan(&mut db.pager, table)? {
-        keys.push(index.key(&row, decode_key(&key)?)?);
+    for stored in scan(&mut db.pager, table)? {
+        keys.push(index.key(&stored.row, decode_key(&stored.key)?)?);
     }
     keys.sort_unstable();
     Ok(keys)
 }
 
-pub(super) fn drop(db: &mut Database, name: &str, if_exists: bool) -> Result<Output> {
+pub(super) fn drop(db: &mut Engine, name: &str, if_exists: bool) -> Result<Output> {
     match db.catalog.drop_index(&mut db.pager, name)? {
-        Some(_) => Ok(Output::Message(format!("dropped index {name}"))),
+        Some(_) => {
+            db.wrote = true;
+            Ok(Output::Message(format!("dropped index {name}")))
+        }
         None if if_exists => Ok(Output::Message(format!("no index {name}, skipped"))),
         None => Err(Error::Query(format!("no such index: {name}"))),
     }
@@ -109,7 +114,7 @@ pub(super) fn drop(db: &mut Database, name: &str, if_exists: bool) -> Result<Out
 /// Verify every index on `table`: its tree's invariants, and that it holds
 /// exactly one entry per row. Returns how many pages the indexes use, and
 /// how many indexes there were.
-pub(super) fn check(db: &mut Database, table: &TableSchema) -> Result<(usize, usize)> {
+pub(super) fn check(db: &mut Engine, table: &TableSchema) -> Result<(usize, usize)> {
     let indexes = db.catalog.indexes_of(&mut db.pager, &table.name)?;
     let mut pages = 0;
     for index in &indexes {

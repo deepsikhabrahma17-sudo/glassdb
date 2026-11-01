@@ -69,6 +69,17 @@ impl Pager {
         self.header.free_count
     }
 
+    /// The oldest transaction `AS OF` can still reach. Kept in the header, so
+    /// it commits and rolls back with the vacuum that moved it.
+    pub fn history_floor(&self) -> u64 {
+        self.header.history_floor
+    }
+
+    pub fn set_history_floor(&mut self, txn: u64) {
+        self.header.history_floor = txn;
+        self.header_dirty = true;
+    }
+
     /// How many committed transactions the log held when this pager opened.
     /// More than zero means the last session ended without a clean close.
     pub fn recovered(&self) -> usize {

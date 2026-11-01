@@ -3,28 +3,36 @@
 //! Each works in two passes: first compute and check every row and index key
 //! it will write (types, primary keys, sizes), then write. If the first pass
 //! finds a problem, nothing has been written yet.
+//!
+//! A row's new version is stamped with the writing transaction, and the
+//! version it replaces moves to the history tree, unless that same transaction
+//! wrote it: no moment can ever see a version that lived only inside one
+//! transaction, so it is simply overwritten.
 
 use std::collections::HashSet;
 
-use super::access::{check_filter, fetch, plan, trace_plan, write_steps};
+use super::access::{Stored, check_filter, fetch, plan, trace_plan, write_steps};
 use super::eval::{Scope, check_columns, eval, is_true};
 use super::index::{self, Indexed};
-use super::{Database, Output};
+use super::{Engine, Output};
 use crate::btree::{BTree, MAX_ENTRY};
 use crate::catalog::TableSchema;
 use crate::error::{Error, Result};
+use crate::mvcc::{TXN_BYTES, TxnId, history_key, stamped};
 use crate::sql::Expr;
+use crate::trace::Event;
 use crate::types::{Value, decode_key, encode_key, encode_row};
 
-/// Table keys are 8-byte row ids, which leaves this much room for the row.
-const MAX_ROW: usize = MAX_ENTRY - 8;
+/// The largest row that fits in the history tree, whose 16-byte keys and
+/// `deleted_by` stamp leave it less room than the table tree.
+const MAX_ROW: usize = MAX_ENTRY - 16 - TXN_BYTES;
 
 fn query<T>(msg: String) -> Result<T> {
     Err(Error::Query(msg))
 }
 
 pub(super) fn insert(
-    db: &mut Database,
+    db: &mut Engine,
     table: &str,
     columns: Option<&[String]>,
     rows: &[Vec<Expr>],
@@ -50,6 +58,7 @@ pub(super) fn insert(
     let tree = BTree::open(schema.root);
     let indexes = index::open_all(db, &schema)?;
     let pk = schema.primary_key();
+    let txn = db.next_txn();
 
     // Rows without a key get the next id after the largest one so far.
     let mut next_id: i128 = match tree.last(&mut db.pager)? {
@@ -91,9 +100,10 @@ pub(super) fn insert(
             .iter()
             .map(|index| index.key(&row, id))
             .collect::<Result<_>>()?;
-        prepared.push((key, row_bytes(&row)?, entries));
+        prepared.push((key, stamped(txn, &row_bytes(&row)?), entries));
     }
 
+    db.wrote = true;
     for (key, bytes, entries) in &prepared {
         tree.insert(&mut db.pager, key, bytes)?;
         for (index, entry) in indexes.iter().zip(entries) {
@@ -105,7 +115,7 @@ pub(super) fn insert(
 
 /// Check an UPDATE's names. Returns the table and the column each SET fills.
 pub(super) fn check_update<'a>(
-    db: &mut Database,
+    db: &mut Engine,
     table: &str,
     assignments: &'a [(String, Expr)],
     filter: Option<&Expr>,
@@ -123,6 +133,50 @@ pub(super) fn check_update<'a>(
     Ok((schema, targets))
 }
 
+/// An old version on its way to the history tree.
+struct Kept {
+    rowid: i64,
+    created: TxnId,
+    row: Vec<u8>,
+}
+
+impl Kept {
+    /// What to keep of `stored` when `txn` replaces it, if anything.
+    fn of(stored: &Stored, txn: TxnId) -> Result<Option<Kept>> {
+        if stored.created == txn {
+            return Ok(None);
+        }
+        Ok(Some(Kept {
+            rowid: decode_key(&stored.key)?,
+            created: stored.created,
+            row: encode_row(&stored.row),
+        }))
+    }
+}
+
+/// Move old versions into `schema`'s history tree, marked as replaced by `txn`.
+fn keep(db: &mut Engine, schema: &TableSchema, kept: &[Kept], txn: TxnId) -> Result<()> {
+    let history = BTree::open(schema.history_root);
+    for version in kept {
+        let key = history_key(version.rowid, version.created);
+        if history
+            .insert(&mut db.pager, &key, &stamped(txn, &version.row))?
+            .is_some()
+        {
+            return Err(Error::Corrupt(format!(
+                "row {} of {} has two versions from txn {}",
+                version.rowid, schema.name, version.created
+            )));
+        }
+        db.pager.tracer().event(&Event::VersionKept {
+            rowid: version.rowid,
+            created: version.created,
+            deleted: txn,
+        });
+    }
+    Ok(())
+}
+
 /// An index entry an UPDATE replaces.
 struct EntryChange {
     index: usize,
@@ -131,7 +185,7 @@ struct EntryChange {
 }
 
 pub(super) fn update(
-    db: &mut Database,
+    db: &mut Engine,
     table: &str,
     assignments: &[(String, Expr)],
     filter: Option<&Expr>,
@@ -141,6 +195,7 @@ pub(super) fn update(
     let tree = BTree::open(schema.root);
     let indexes = index::open_all(db, &schema)?;
     let pk = schema.primary_key();
+    let txn = db.next_txn();
     let access = plan(db, &schema, filter)?;
     let action = format!("UPDATE {table}");
     trace_plan(db, write_steps(table, &access, filter, action));
@@ -148,10 +203,13 @@ pub(super) fn update(
     // Pass 1: the new version of every matching row, as (old key, new key, bytes).
     let mut changes = Vec::new();
     let mut entry_changes = Vec::new();
-    for (key, row) in fetch(&mut db.pager, &schema, &access)? {
+    let mut kept = Vec::new();
+    for stored in fetch(&mut db.pager, &schema, &access)? {
+        let row = &stored.row;
+        let key = &stored.key;
         let scope = Scope {
             schema: scope_schema,
-            row: &row,
+            row,
         };
         if let Some(filter) = filter
             && !is_true(&eval(filter, &scope)?, "WHERE")?
@@ -175,15 +233,16 @@ pub(super) fn update(
                 }
             },
         };
-        let bytes = row_bytes(&new_row)?;
+        let bytes = stamped(txn, &row_bytes(&new_row)?);
         for (i, index) in indexes.iter().enumerate() {
-            let old = index.key(&row, decode_key(&key)?)?;
+            let old = index.key(row, decode_key(key)?)?;
             let new = index.key(&new_row, decode_key(&new_key)?)?;
             if old != new {
                 entry_changes.push(EntryChange { index: i, old, new });
             }
         }
-        changes.push((key, new_key, bytes));
+        kept.extend(Kept::of(&stored, txn)?);
+        changes.push((stored.key, new_key, bytes));
     }
 
     // A row whose key changes may land on a key that is free, or on one that
@@ -204,7 +263,10 @@ pub(super) fn update(
         }
     }
 
-    // Pass 2: take moved rows out of their old places, then write every new version.
+    // Pass 2: save the old versions, take moved rows out of their old places,
+    // then write every new version.
+    db.wrote |= !changes.is_empty();
+    keep(db, &schema, &kept, txn)?;
     for (old, new, _) in &changes {
         if old != new {
             tree.delete(&mut db.pager, old)?;
@@ -227,7 +289,7 @@ pub(super) fn update(
 
 /// Check a DELETE's names. Returns the table.
 pub(super) fn check_delete(
-    db: &mut Database,
+    db: &mut Engine,
     table: &str,
     filter: Option<&Expr>,
 ) -> Result<TableSchema> {
@@ -236,19 +298,21 @@ pub(super) fn check_delete(
     Ok(schema)
 }
 
-pub(super) fn delete(db: &mut Database, table: &str, filter: Option<&Expr>) -> Result<Output> {
+pub(super) fn delete(db: &mut Engine, table: &str, filter: Option<&Expr>) -> Result<Output> {
     let schema = check_delete(db, table, filter)?;
     let indexes: Vec<Indexed> = index::open_all(db, &schema)?;
+    let txn = db.next_txn();
     let access = plan(db, &schema, filter)?;
     let action = format!("DELETE FROM {table}");
     trace_plan(db, write_steps(table, &access, filter, action));
 
     let mut doomed = Vec::new();
     let mut entries = Vec::new();
-    for (key, row) in fetch(&mut db.pager, &schema, &access)? {
+    let mut kept = Vec::new();
+    for stored in fetch(&mut db.pager, &schema, &access)? {
         let scope = Scope {
             schema: Some(&schema),
-            row: &row,
+            row: &stored.row,
         };
         if let Some(filter) = filter
             && !is_true(&eval(filter, &scope)?, "WHERE")?
@@ -256,10 +320,13 @@ pub(super) fn delete(db: &mut Database, table: &str, filter: Option<&Expr>) -> R
             continue;
         }
         for (i, index) in indexes.iter().enumerate() {
-            entries.push((i, index.key(&row, decode_key(&key)?)?));
+            entries.push((i, index.key(&stored.row, decode_key(&stored.key)?)?));
         }
-        doomed.push(key);
+        kept.extend(Kept::of(&stored, txn)?);
+        doomed.push(stored.key);
     }
+    db.wrote |= !doomed.is_empty();
+    keep(db, &schema, &kept, txn)?;
     let tree = BTree::open(schema.root);
     for key in &doomed {
         tree.delete(&mut db.pager, key)?;

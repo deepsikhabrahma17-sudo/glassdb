@@ -2,24 +2,39 @@
 //! columns, sort, then apply OFFSET and LIMIT.
 //!
 //! The planner picks how to find the rows (see `access`), but WHERE is always
-//! applied to them, so that choice never changes the result.
+//! applied to them, so that choice never changes the result. `AS OF` and
+//! `HISTORY` change only where the rows come from.
 
 use std::cmp::Ordering;
 
-use super::access::{fetch, plan, trace_plan};
+use super::access::{Stored, fetch, plan, row_range, trace_plan};
 use super::eval::{Scope, check_columns, eval, is_true};
-use super::{Database, Output};
+use super::history;
+use super::{Engine, Output};
 use crate::btree::BTree;
 use crate::catalog::TableSchema;
 use crate::error::{Error, Result};
+use crate::mvcc::{TxnId, rows_at};
 use crate::pager::Pager;
-use crate::planner::Access;
-use crate::sql::{Expr, Select, SelectItem};
-use crate::types::{Value, decode_row};
+use crate::planner::{Access, choose};
+use crate::sql::{Expr, Select, SelectItem, When};
+use crate::types::Value;
+
+/// Where a SELECT's rows come from.
+enum Source {
+    /// The table as it is.
+    Now,
+    /// The table as it was at a transaction.
+    At(TxnId),
+    /// Every version. Holds the plain table, because `Prepared::schema` has
+    /// the extra columns.
+    History(TableSchema),
+}
 
 /// A SELECT after checking, ready to run.
 pub(super) struct Prepared {
     schema: Option<TableSchema>,
+    source: Source,
     /// How to find the rows, if there is a table to find them in.
     access: Option<Access>,
     columns: Vec<String>,
@@ -28,10 +43,13 @@ pub(super) struct Prepared {
 }
 
 /// Check everything that can be checked before any row is read, and plan.
-pub(super) fn prepare(db: &mut Database, s: &Select) -> Result<Prepared> {
-    let table = match &s.from {
-        Some(name) => Some(db.table(name)?),
-        None => None,
+pub(super) fn prepare(db: &mut Engine, s: &Select) -> Result<Prepared> {
+    let (table, source) = match &s.from {
+        Some(name) => {
+            let (table, source) = resolve(db, name, s.when)?;
+            (Some(table), source)
+        }
+        None => (None, Source::Now),
     };
     let schema = table.as_ref();
 
@@ -60,12 +78,15 @@ pub(super) fn prepare(db: &mut Database, s: &Select) -> Result<Prepared> {
     }
     let offset = count(s.offset.as_ref(), "OFFSET")?.unwrap_or(0);
     let limit = count(s.limit.as_ref(), "LIMIT")?;
-    let access = match schema {
-        Some(t) => Some(plan(db, t, s.filter.as_ref())?),
-        None => None,
+    let access = match (schema, &source) {
+        (Some(t), Source::Now) => Some(plan(db, t, s.filter.as_ref())?),
+        // Indexes hold only current rows, so the past can't use them.
+        (Some(t), _) => Some(choose(t, &[], s.filter.as_ref())),
+        (None, _) => None,
     };
     Ok(Prepared {
         access,
+        source,
         schema: table,
         columns,
         offset,
@@ -73,10 +94,35 @@ pub(super) fn prepare(db: &mut Database, s: &Select) -> Result<Prepared> {
     })
 }
 
+/// The table a SELECT names, at the moment it asks for.
+fn resolve(db: &mut Engine, name: &str, when: When) -> Result<(TableSchema, Source)> {
+    let at = match when {
+        When::Now => return Ok((db.table(name)?, Source::Now)),
+        When::History => {
+            let table = db.table(name)?;
+            return Ok((history::schema(&table)?, Source::History(table)));
+        }
+        When::Txn(txn) => txn,
+        When::Time(time) => db.commits.txn_at(&mut db.pager, time, db.last.txn)?,
+    };
+    db.check_past(at)?;
+    match db.catalog.table_at(&mut db.pager, name, at)? {
+        Some(table) => Ok((table, Source::At(at))),
+        None => Err(Error::Query(format!("no table {name} at txn {at}"))),
+    }
+}
+
 /// The steps of a prepared SELECT, as `EXPLAIN` shows them.
 pub(super) fn select_steps(s: &Select, p: &Prepared) -> Vec<String> {
     let mut steps = match (&p.schema, &p.access) {
-        (Some(table), Some(access)) => vec![access.describe(&table.name)],
+        (Some(table), Some(access)) => {
+            let found = access.describe(&table.name);
+            vec![match &p.source {
+                Source::Now => found,
+                Source::At(txn) => format!("{found} AS OF TXN {txn}"),
+                Source::History(_) => format!("{found} HISTORY"),
+            }]
+        }
         _ => vec!["ONE ROW (no table)".to_string()],
     };
     if let Some(filter) = &s.filter {
@@ -95,11 +141,12 @@ pub(super) fn select_steps(s: &Select, p: &Prepared) -> Vec<String> {
     steps
 }
 
-pub(super) fn select(db: &mut Database, s: &Select) -> Result<Output> {
+pub(super) fn select(db: &mut Engine, s: &Select) -> Result<Output> {
     let prepared = prepare(db, s)?;
     trace_plan(db, select_steps(s, &prepared));
     let Prepared {
         schema: table,
+        source,
         access,
         columns,
         offset,
@@ -108,16 +155,20 @@ pub(super) fn select(db: &mut Database, s: &Select) -> Result<Output> {
     let schema = table.as_ref();
 
     // Without FROM there is exactly one (empty) row to compute on.
-    let source = match (schema, &access) {
-        (Some(t), Some(access)) => fetch(&mut db.pager, t, access)?
+    let rows = match (schema, &access, source) {
+        (Some(t), Some(access), Source::Now) => fetch(&mut db.pager, t, access)?
             .into_iter()
-            .map(|(_, row)| row)
+            .map(|stored| stored.row)
             .collect(),
+        (Some(t), Some(access), Source::At(at)) => {
+            rows_at(&mut db.pager, t, &row_range(access), at)?
+        }
+        (_, Some(access), Source::History(table)) => history::rows(db, &table, &row_range(access))?,
         _ => vec![Vec::new()],
     };
 
     let mut results = Vec::new();
-    for row in source {
+    for row in rows {
         let scope = Scope { schema, row: &row };
         if let Some(filter) = &s.filter
             && !is_true(&eval(filter, &scope)?, "WHERE")?
@@ -193,26 +244,12 @@ fn count(expr: Option<&Expr>, clause: &str) -> Result<Option<usize>> {
     }
 }
 
-/// Every row of a table in key order, with its key.
-pub(super) fn scan(pager: &mut Pager, table: &TableSchema) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+/// Every current row of a table in key order.
+pub(super) fn scan(pager: &mut Pager, table: &TableSchema) -> Result<Vec<Stored>> {
     let mut rows = Vec::new();
     for entry in BTree::open(table.root).iter(pager)? {
         let (key, bytes) = entry?;
-        rows.push((key, decode(table, &bytes)?));
+        rows.push(Stored::decode(table, key, &bytes)?);
     }
     Ok(rows)
-}
-
-/// A row of `table`, from its stored bytes.
-pub(super) fn decode(table: &TableSchema, bytes: &[u8]) -> Result<Vec<Value>> {
-    let row = decode_row(bytes)?;
-    if row.len() != table.columns.len() {
-        return Err(Error::Corrupt(format!(
-            "a row of {} has {} values for {} columns",
-            table.name,
-            row.len(),
-            table.columns.len()
-        )));
-    }
-    Ok(row)
 }

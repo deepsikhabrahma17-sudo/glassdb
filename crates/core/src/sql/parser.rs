@@ -7,22 +7,25 @@
 //! column := name type [PRIMARY KEY]
 //! drop   := DROP TABLE [IF EXISTS] name
 //! insert := INSERT INTO name [( name {, name} )] VALUES row {, row}
-//! select := SELECT item {, item} [FROM name] [WHERE expr]
+//! select := SELECT item {, item} [FROM name [when]] [WHERE expr]
 //!           [ORDER BY expr [ASC|DESC] {, ...}] [LIMIT expr [OFFSET expr]]
+//! when   := AS OF string | AS OF TXN number | HISTORY
 //! update := UPDATE name SET name = expr {, name = expr} [WHERE expr]
 //! delete := DELETE FROM name [WHERE expr]
 //! txn    := BEGIN [TRANSACTION] | COMMIT | ROLLBACK
 //! index  := CREATE INDEX [IF NOT EXISTS] name ON name ( name {, name} )
 //!         | DROP INDEX [IF EXISTS] name
 //! plan   := EXPLAIN (select | update | delete)
+//! vacuum := VACUUM HISTORY BEFORE string
 //! ```
 //!
-//! `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION`, `INDEX`, `ON` and `EXPLAIN`
-//! aren't keywords, only words with a meaning where no name can be. Reserving
-//! them would stop databases that use them as names from opening, because the
-//! catalog parses its stored `CREATE TABLE` text.
+//! `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION`, `INDEX`, `ON`, `EXPLAIN`,
+//! `OF`, `TXN`, `HISTORY`, `VACUUM` and `BEFORE` aren't keywords, only words
+//! with a meaning where no name can be. Reserving them would stop databases
+//! that use them as names from opening, because the catalog parses its stored
+//! `CREATE TABLE` text. `SELECT`'s own rules are in `select.rs`.
 
-use super::ast::{ColumnDef, CreateIndex, CreateTable, OrderBy, Select, SelectItem, Statement};
+use super::ast::{ColumnDef, CreateIndex, CreateTable, Statement};
 use super::token::{Keyword, Spanned, Token, tokenize};
 use crate::error::{Error, Result};
 use crate::types::DataType;
@@ -115,7 +118,7 @@ impl Parser {
         self.error(format!("expected {what}, found {}", self.peek()))
     }
 
-    fn name(&mut self, what: &str) -> Result<String> {
+    pub(super) fn name(&mut self, what: &str) -> Result<String> {
         match self.peek().clone() {
             Token::Ident(name) => {
                 self.advance();
@@ -126,7 +129,10 @@ impl Parser {
     }
 
     /// `item {, item}`, where each item is parsed by `one`.
-    fn comma_list<T>(&mut self, mut one: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<T>> {
+    pub(super) fn comma_list<T>(
+        &mut self,
+        mut one: impl FnMut(&mut Self) -> Result<T>,
+    ) -> Result<Vec<T>> {
         let mut items = vec![one(self)?];
         while self.eat(&Token::Comma) {
             items.push(one(self)?);
@@ -155,6 +161,7 @@ impl Parser {
                 self.advance();
                 Ok(Statement::Rollback)
             }
+            Token::Ident(word) if word == "vacuum" => self.vacuum(),
             Token::Ident(word) if word == "explain" => {
                 self.advance();
                 match self.peek() {
@@ -166,13 +173,13 @@ impl Parser {
             }
             _ => self.expected(
                 "a statement (CREATE, DROP, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT, \
-                 ROLLBACK or EXPLAIN)",
+                 ROLLBACK, EXPLAIN or VACUUM)",
             ),
         }
     }
 
     /// Move past the current token if it is the unreserved word `word`.
-    fn eat_word(&mut self, word: &str) -> bool {
+    pub(super) fn eat_word(&mut self, word: &str) -> bool {
         let found = matches!(self.peek(), Token::Ident(found) if found == word);
         if found {
             self.advance();
@@ -296,58 +303,6 @@ impl Parser {
         })
     }
 
-    fn select(&mut self) -> Result<Select> {
-        self.expect_keyword(Keyword::Select)?;
-        let items = self.comma_list(Self::select_item)?;
-        let from = if self.eat_keyword(Keyword::From) {
-            Some(self.name("a table name")?)
-        } else {
-            None
-        };
-        let filter = self.where_clause()?;
-        let mut order_by = Vec::new();
-        if self.eat_keyword(Keyword::Order) {
-            self.expect_keyword(Keyword::By)?;
-            order_by = self.comma_list(|p| {
-                let expr = p.expr()?;
-                let descending = p.eat_keyword(Keyword::Desc);
-                if !descending {
-                    p.eat_keyword(Keyword::Asc);
-                }
-                Ok(OrderBy { expr, descending })
-            })?;
-        }
-        let (mut limit, mut offset) = (None, None);
-        if self.eat_keyword(Keyword::Limit) {
-            limit = Some(self.expr()?);
-            if self.eat_keyword(Keyword::Offset) {
-                offset = Some(self.expr()?);
-            }
-        }
-        Ok(Select {
-            items,
-            from,
-            filter,
-            order_by,
-            limit,
-            offset,
-        })
-    }
-
-    fn select_item(&mut self) -> Result<SelectItem> {
-        if self.eat(&Token::Star) {
-            return Ok(SelectItem::Wildcard);
-        }
-        let expr = self.expr()?;
-        // `expr AS name`, or just `expr name`.
-        let alias = if self.eat_keyword(Keyword::As) || matches!(self.peek(), Token::Ident(_)) {
-            Some(self.name("a column alias")?)
-        } else {
-            None
-        };
-        Ok(SelectItem::Expr { expr, alias })
-    }
-
     fn update(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Update)?;
         let table = self.name("a table name")?;
@@ -373,7 +328,7 @@ impl Parser {
         Ok(Statement::Delete { table, filter })
     }
 
-    fn where_clause(&mut self) -> Result<Option<super::ast::Expr>> {
+    pub(super) fn where_clause(&mut self) -> Result<Option<super::ast::Expr>> {
         if self.eat_keyword(Keyword::Where) {
             Ok(Some(self.expr()?))
         } else {

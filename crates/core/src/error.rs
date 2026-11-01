@@ -43,7 +43,11 @@ impl fmt::Display for Error {
         match self {
             Error::Io(err) => write!(f, "I/O error: {err}"),
             Error::BadMagic => write!(f, "not a GlassDB database file (bad magic bytes)"),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported file format version {v}"),
+            Error::UnsupportedVersion(v) => write!(
+                f,
+                "file format version {v} isn't supported: this GlassDB reads version {}",
+                crate::pager::header::FORMAT_VERSION
+            ),
             Error::BadPageSize(size) => write!(f, "unsupported page size {size}"),
             Error::PageOutOfRange(id) => write!(f, "page {id} is out of range"),
             Error::Corrupt(msg) => write!(f, "database file is corrupt: {msg}"),

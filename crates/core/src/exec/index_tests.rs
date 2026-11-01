@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::btree::MAX_KEY;
+use crate::btree::{BTree, MAX_KEY};
 use crate::storage::MemStorage;
 use crate::trace::{Event, RecordingTracer};
 
@@ -264,7 +264,11 @@ fn dropping_a_table_frees_its_indexes() {
 
     assert!(db.indexes().unwrap().is_empty());
     let report = db.check().unwrap();
-    assert_eq!(report.pages - report.free_pages, before);
+    assert_eq!(
+        report.pages - report.free_pages,
+        before + 2,
+        "only its rows and history stay, until vacuum"
+    );
 }
 
 #[test]
@@ -288,8 +292,10 @@ fn check_finds_an_entry_missing_from_an_index() {
     let disks = Disks::new();
     let mut db = seeded(&disks);
     let tree = index_tree(&mut db, "by_n");
-    let (key, _) = tree.iter(&mut db.pager).unwrap().next().unwrap().unwrap();
-    tree.delete(&mut db.pager, &key).unwrap();
+    db.with_pager(|pager| {
+        let (key, _) = tree.iter(pager).unwrap().next().unwrap().unwrap();
+        tree.delete(pager, &key).unwrap();
+    });
     let message = db.check().unwrap_err().to_string();
     assert!(message.contains("by_n"), "{message}");
 }
@@ -299,12 +305,8 @@ fn check_finds_an_entry_with_no_row() {
     let disks = Disks::new();
     let mut db = seeded(&disks);
     let tree = index_tree(&mut db, "by_n");
-    tree.insert(
-        &mut db.pager,
-        &crate::types::index_key(&[Value::Int(99)], 99),
-        &[],
-    )
-    .unwrap();
+    let key = crate::types::index_key(&[Value::Int(99)], 99);
+    db.with_pager(|pager| tree.insert(pager, &key, &[]).unwrap());
     let message = db.check().unwrap_err().to_string();
     assert!(message.contains("by_n"), "{message}");
 }
@@ -314,12 +316,8 @@ fn a_lookup_finds_a_stale_entry_rather_than_returning_nothing() {
     let disks = Disks::new();
     let mut db = seeded(&disks);
     let tree = index_tree(&mut db, "by_n");
-    tree.insert(
-        &mut db.pager,
-        &crate::types::index_key(&[Value::Int(99)], 99),
-        &[],
-    )
-    .unwrap();
+    let key = crate::types::index_key(&[Value::Int(99)], 99);
+    db.with_pager(|pager| tree.insert(pager, &key, &[]).unwrap());
     let message = err(&mut db, "SELECT * FROM t WHERE n = 99");
     assert!(message.contains("corrupt"), "{message}");
 }

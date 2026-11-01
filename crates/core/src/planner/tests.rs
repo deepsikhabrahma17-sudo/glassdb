@@ -12,6 +12,8 @@ fn table() -> TableSchema {
     TableSchema {
         name: "t".into(),
         root: 2,
+        history_root: 0,
+        created: 0,
         columns: vec![
             column("id", DataType::Int, true),
             column("a", DataType::Int, false),

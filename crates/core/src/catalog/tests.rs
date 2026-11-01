@@ -17,7 +17,7 @@ fn open(disk: &MemStorage) -> (Pager, Catalog) {
 
 fn create(pager: &mut Pager, catalog: &Catalog, sql: &str) -> crate::error::Result<TableSchema> {
     match parse_one(sql).unwrap() {
-        Statement::CreateTable(def) => catalog.create(pager, &def),
+        Statement::CreateTable(def) => catalog.create(pager, &def, 1),
         other => panic!("not CREATE TABLE: {other:?}"),
     }
 }
@@ -125,9 +125,9 @@ fn drop_frees_every_page_of_the_table() {
     }
     assert!(pager.page_count() > 10);
 
-    assert_eq!(catalog.drop(&mut pager, "t").unwrap(), Some(t));
+    assert_eq!(catalog.drop(&mut pager, "t", 1).unwrap(), Some(t));
     assert_eq!(catalog.get(&mut pager, "t").unwrap(), None);
-    assert_eq!(catalog.drop(&mut pager, "t").unwrap(), None);
+    assert_eq!(catalog.drop(&mut pager, "t", 1).unwrap(), None);
     // Only the header and the catalog root are still in use.
     assert_eq!(pager.free_count(), pager.page_count() - 2);
 }

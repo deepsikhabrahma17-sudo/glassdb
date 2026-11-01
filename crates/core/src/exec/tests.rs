@@ -114,10 +114,15 @@ fn check_reports_the_shape_of_the_database() {
     let report = db.check().unwrap();
     assert_eq!(report.tables, 2);
     assert_eq!(report.rows, 3);
-    assert_eq!(report.pages, 4, "header, catalog and one page per table");
+    assert_eq!(
+        report.pages, 7,
+        "header, catalog, commit log, and two trees per table"
+    );
     assert_eq!(report.free_pages, 0);
     db.execute("DROP TABLE a").unwrap();
-    assert_eq!(db.check().unwrap().free_pages, 1);
+    let report = db.check().unwrap();
+    assert_eq!(report.tables, 1);
+    assert_eq!(report.free_pages, 0, "its rows wait for vacuum");
 }
 
 #[test]
@@ -168,5 +173,5 @@ fn checkpoint_moves_the_log_into_the_main_file() {
         "still only in the log"
     );
     db.checkpoint().unwrap();
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 3 * 4096);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 5 * 4096);
 }

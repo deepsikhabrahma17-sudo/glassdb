@@ -253,7 +253,11 @@ fn creates_a_new_database_file() {
     let db = dir.path().join("new.db");
     let (stdout, _) = session(&db, ".exit\n");
     let bytes = std::fs::read(&db).expect("database file was created");
-    assert_eq!(bytes.len(), 2 * 4096, "header page + catalog page");
+    assert_eq!(
+        bytes.len(),
+        3 * 4096,
+        "header page + catalog page + commit log page"
+    );
     assert_eq!(&bytes[..8], b"GLASSDB\0");
     assert!(stdout.contains("(0 tables)"), "{stdout}");
 }
@@ -273,4 +277,76 @@ fn rejects_a_file_that_is_not_a_database() {
     );
     // The file is left untouched.
     assert_eq!(std::fs::read(&db).unwrap(), vec![0xFF; 4096]);
+}
+
+#[test]
+fn as_of_and_history_work_from_the_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = session(
+        &dir.path().join("test.db"),
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT);\n\
+         INSERT INTO t VALUES (1, 10);\n\
+         UPDATE t SET n = 11;\n\
+         SELECT n AS was FROM t AS OF TXN 2;\n\
+         SELECT n, created_txn, deleted_txn FROM t HISTORY;\n",
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+    let was = stdout.find("was").expect(&stdout);
+    assert!(stdout[was..].contains("10"), "{stdout}");
+    assert!(stdout.contains("created_txn"), "{stdout}");
+}
+
+#[test]
+fn commits_lists_the_newest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = session(
+        &dir.path().join("test.db"),
+        ".commits\n\
+         CREATE TABLE t (a INT);\n\
+         INSERT INTO t VALUES (1);\n\
+         .commits 1\n\
+         .commits many\n",
+    );
+    assert!(stdout.contains("no commits yet"), "{stdout}");
+    assert!(stdout.contains("txn 2  20"), "{stdout}");
+    assert!(!stdout.contains("txn 1  "), "{stdout}");
+    assert!(stderr.contains("takes a number"), "{stderr}");
+}
+
+#[test]
+fn a_snapshot_holds_selects_still_while_writes_go_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = session(
+        &dir.path().join("test.db"),
+        "CREATE TABLE t (n INT);\n\
+         INSERT INTO t VALUES (1);\n\
+         .snapshot\n\
+         INSERT INTO t VALUES (2);\n\
+         SELECT n AS during FROM t;\n\
+         EXPLAIN SELECT * FROM t;\n\
+         .snapshot off\n\
+         SELECT n AS after FROM t;\n\
+         .snapshot wrong\n",
+    );
+    assert!(stderr.contains("takes nothing or off"), "{stderr}");
+    assert!(stdout.contains("SELECTs now read txn 2"), "{stdout}");
+    assert!(stdout.contains("AS OF TXN 2"), "{stdout}");
+    let during = stdout.find("during").expect(&stdout);
+    let after = stdout.find("after").expect(&stdout);
+    assert!(stdout[during..after].contains("(1 row)"), "{stdout}");
+    assert!(stdout[after..].contains("(2 rows)"), "{stdout}");
+}
+
+#[test]
+fn an_old_file_format_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("old.db");
+    session(&db, "CREATE TABLE t (a INT);\n");
+    let mut bytes = std::fs::read(&db).unwrap();
+    bytes[8] = 1;
+    std::fs::write(&db, bytes).unwrap();
+    let out = run(&[db.to_str().unwrap()], ".exit\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("file format version 1"), "{stderr}");
 }
